@@ -13,46 +13,26 @@ def download_audio():
     if request.is_json:
         data = request.json
         youtube_url = data.get('url')
-
+        
         if not youtube_url:
             return "No URL provided", 400
 
         # Strip the playlist part from the URL if it exists
         if "&list=" in youtube_url:
             youtube_url = youtube_url.split("&list=")[0]
-
+        
         # Use a temporary directory to store the file
         with tempfile.TemporaryDirectory() as temp_dir:
-            
-            # Add a check to confirm the cookies file exists
-            cookie_path = os.path.join(os.getcwd(), 'cookies.txt')
-            if not os.path.exists(cookie_path):
-                print(f"Error: Cookies file not found at {cookie_path}")
-                # We can still proceed with the download, but expect it to fail
-                # if YouTube requires authentication.
-                ydl_opts = {
-                    'force_single_video': True,
-                    'format': 'bestaudio/best',
-                    'outtmpl': os.path.join(temp_dir, 'downloaded_audio.%(ext)s'),
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }],
-                }
-            else:
-                ydl_opts = {
-                    'force_single_video': True,
-                    'format': 'bestaudio/best',
-                    'outtmpl': os.path.join(temp_dir, 'downloaded_audio.%(ext)s'),
-                    'postprocessors': [{
-                        'key': 'FFmpegExtractAudio',
-                        'preferredcodec': 'mp3',
-                        'preferredquality': '192',
-                    }],
-                    # The server is getting a "bot" error and needs to be logged in.
-                    'cookiefile': cookie_path,
-                }
+            ydl_opts = {
+                'force_single_video': True,
+                'format': 'bestaudio/best',
+                'outtmpl': os.path.join(temp_dir, 'downloaded_audio.%(ext)s'),
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            }
             
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -80,3 +60,4 @@ def download_audio():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
+
