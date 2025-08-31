@@ -21,12 +21,12 @@ def download_audio():
         with tempfile.TemporaryDirectory() as temp_dir:
             # Read cookies from environment variable and save to a temporary file
             cookies_str = os.getenv('YOUTUBE_COOKIES')
+            cookies_file_path = None
             if cookies_str:
                 cookies_file_path = os.path.join(temp_dir, 'cookies.txt')
                 with open(cookies_file_path, 'w') as f:
                     f.write(cookies_str)
-            else:
-                cookies_file_path = None
+                print(f"Cookie file created at {cookies_file_path}")
             
             ydl_opts = {
                 'force_single_video': True,
