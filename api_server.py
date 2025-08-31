@@ -19,18 +19,10 @@ def download_audio():
             youtube_url = youtube_url.split("&list=")[0]
         
         with tempfile.TemporaryDirectory() as temp_dir:
-            # Read cookies from environment variable and save to a temporary file
-            cookies_str = os.getenv('YOUTUBE_COOKIES')
-            cookies_file_path = None
-            if cookies_str:
-                cookies_file_path = os.path.join(temp_dir, 'cookies.txt')
-                with open(cookies_file_path, 'w') as f:
-                    f.write(cookies_str)
-                print(f"Cookie file created at {cookies_file_path}")
-            
-            # Read the proxy URL from the environment variable
-            proxy_url = os.getenv('PROXY_URL')
-            
+            proxy_url = os.getenv('http://bqgkebje:u67be8bb5ia9@23.95.150.145:6114/')
+            username = os.getenv('u6517763368@gmail.com ')
+            password = os.getenv('yttomp3.,?')
+
             ydl_opts = {
                 'force_single_video': True,
                 'format': 'bestaudio/best',
@@ -40,10 +32,13 @@ def download_audio():
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
-                'cookiefile': cookies_file_path,
                 'proxy': proxy_url
             }
-            
+
+            if username and password:
+                ydl_opts['username'] = username
+                ydl_opts['password'] = password
+
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(youtube_url, download=True)
