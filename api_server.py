@@ -6,11 +6,6 @@ import json
 
 app = Flask(__name__)
 
-# Define the path to your cookies file.
-# You will need to ensure this file exists in your deployment environment.
-# For Render, you might use an environment variable to specify the path to a secret file.
-COOKIES_FILE = os.getenv('YOUTUBE_COOKIES_PATH', 'cookies.txt')
-
 # This route will handle the download request from your app.
 @app.route('/download/audio', methods=['POST'])
 def download_audio():
@@ -18,27 +13,46 @@ def download_audio():
     if request.is_json:
         data = request.json
         youtube_url = data.get('url')
-        
+
         if not youtube_url:
             return "No URL provided", 400
 
         # Strip the playlist part from the URL if it exists
         if "&list=" in youtube_url:
             youtube_url = youtube_url.split("&list=")[0]
-        
+
         # Use a temporary directory to store the file
         with tempfile.TemporaryDirectory() as temp_dir:
-            ydl_opts = {
-                'force_single_video': True,
-                'format': 'bestaudio/best',
-                'outtmpl': os.path.join(temp_dir, 'downloaded_audio.%(ext)s'),
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'cookiefile': COOKIES_FILE, # Add this line
-            }
+            
+            # Add a check to confirm the cookies file exists
+            cookie_path = os.path.join(os.getcwd(), 'cookies.txt')
+            if not os.path.exists(cookie_path):
+                print(f"Error: Cookies file not found at {cookie_path}")
+                # We can still proceed with the download, but expect it to fail
+                # if YouTube requires authentication.
+                ydl_opts = {
+                    'force_single_video': True,
+                    'format': 'bestaudio/best',
+                    'outtmpl': os.path.join(temp_dir, 'downloaded_audio.%(ext)s'),
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                }
+            else:
+                ydl_opts = {
+                    'force_single_video': True,
+                    'format': 'bestaudio/best',
+                    'outtmpl': os.path.join(temp_dir, 'downloaded_audio.%(ext)s'),
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '192',
+                    }],
+                    # The server is getting a "bot" error and needs to be logged in.
+                    'cookiefile': cookie_path,
+                }
             
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
