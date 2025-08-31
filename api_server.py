@@ -42,8 +42,10 @@ def download_audio():
                 }],
                 # Add a random delay between requests to avoid rate-limiting (429 errors).
                 'sleep_requests': True,
-                'sleep_interval': (2, 5), # Sleep for a random duration between 2 and 5 seconds
+                'sleep_interval': (5, 10), # Increased sleep interval for better rate-limiting avoidance
                 'max_sleep_interval': 60, # The maximum sleep interval in seconds
+                # Enable retries with exponential backoff for network-related errors.
+                'retries': 15,
             }
             if os.path.exists(cookie_path):
                 print("Cookies file found. Using it for authentication.")
