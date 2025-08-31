@@ -46,6 +46,8 @@ def download_audio():
                 'max_sleep_interval': 60, # The maximum sleep interval in seconds
                 # Enable retries with exponential backoff for network-related errors.
                 'retries': 15,
+                # Set a common user agent to bypass bot detection.
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
             }
             if os.path.exists(cookie_path):
                 print("Cookies file found. Using it for authentication.")
