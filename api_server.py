@@ -40,6 +40,10 @@ def download_audio():
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
+                # Add a random delay between requests to avoid rate-limiting (429 errors).
+                'sleep_requests': True,
+                'sleep_interval': (2, 5), # Sleep for a random duration between 2 and 5 seconds
+                'max_sleep_interval': 60, # The maximum sleep interval in seconds
             }
             if os.path.exists(cookie_path):
                 print("Cookies file found. Using it for authentication.")
