@@ -13,16 +13,24 @@ def download_audio():
     if request.is_json:
         data = request.json
         youtube_url = data.get('url')
-        
+
         if not youtube_url:
             return "No URL provided", 400
 
         # Strip the playlist part from the URL if it exists
         if "&list=" in youtube_url:
             youtube_url = youtube_url.split("&list=")[0]
-        
+
         # Use a temporary directory to store the file
         with tempfile.TemporaryDirectory() as temp_dir:
+
+            # Use an absolute path to the cookies file to prevent path issues on the server.
+            # We assume 'cookies.txt' is in the same directory as this script.
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            cookie_path = os.path.join(script_dir, 'cookies.txt')
+
+            print(f"Checking for cookies file at: {cookie_path}")
+
             ydl_opts = {
                 'force_single_video': True,
                 'format': 'bestaudio/best',
@@ -33,13 +41,18 @@ def download_audio():
                     'preferredquality': '192',
                 }],
             }
-            
+            if os.path.exists(cookie_path):
+                print("Cookies file found. Using it for authentication.")
+                ydl_opts['cookiefile'] = cookie_path
+            else:
+                print(f"Error: Cookies file not found at {cookie_path}. Proceeding without it.")
+
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(youtube_url, download=True)
                     # Get the final path from the download info, as this is the most reliable way.
                     final_path = ydl.prepare_filename(info)
-                    
+
                 # The filename can change during post-processing. Check for the mp3 extension.
                 if final_path.endswith('.webm') or final_path.endswith('.ogg'):
                     # The postprocessor created a new file, so we need to get that new path.
@@ -51,13 +64,12 @@ def download_audio():
                     return send_file(final_path, as_attachment=True)
                 else:
                     return "Download failed on the server. File not found.", 500
-            
+
             except Exception as e:
                 print(f"An error occurred: {e}")
                 return f"An error occurred: {e}", 500
-            
+
     return "Invalid request format. Must be JSON.", 400
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
-
