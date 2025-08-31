@@ -28,6 +28,9 @@ def download_audio():
                     f.write(cookies_str)
                 print(f"Cookie file created at {cookies_file_path}")
             
+            # Read the proxy URL from the environment variable
+            proxy_url = os.getenv('PROXY_URL')
+            
             ydl_opts = {
                 'force_single_video': True,
                 'format': 'bestaudio/best',
@@ -37,8 +40,8 @@ def download_audio():
                     'preferredcodec': 'mp3',
                     'preferredquality': '192',
                 }],
-                # Tell yt-dlp to use the cookies file if it exists
-                'cookiefile': cookies_file_path
+                'cookiefile': cookies_file_path,
+                'proxy': proxy_url
             }
             
             try:
