@@ -1,39 +1,167 @@
 import os
 import tempfile
 import time
-import random
 import threading
 import uuid
-from flask import Flask, request, send_file, jsonify, Response
+import gc
+import psutil
+from flask import Flask, request, send_file, jsonify
 import yt_dlp
-import json
 from pathlib import Path
 import logging
+from functools import wraps
 
 # Configure logging for production
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]  # Console only for Render
 )
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# Render.com specific configurations
-app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+# Render.com free tier optimizations
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 300  # Cache files for 5 minutes
 
-# Store for tracking downloads
+# Global variables for tracking
 download_status = {}
 download_files = {}
+active_downloads = 0
+MAX_CONCURRENT_DOWNLOADS = 2  # Limit for free tier
+
+# Rate limiting storage (in-memory for free tier)
+rate_limit_storage = {}
+
+def rate_limit(max_requests=10, window=300):  # 10 requests per 5 minutes
+    """Simple in-memory rate limiting"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            client_ip = request.remote_addr
+            now = time.time()
+            
+            # Clean old entries
+            if client_ip in rate_limit_storage:
+                rate_limit_storage[client_ip] = [
+                    timestamp for timestamp in rate_limit_storage[client_ip]
+                    if now - timestamp < window
+                ]
+            else:
+                rate_limit_storage[client_ip] = []
+            
+            # Check rate limit
+            if len(rate_limit_storage[client_ip]) >= max_requests:
+                return jsonify({
+                    "error": "Rate limit exceeded. Try again later.",
+                    "retry_after": window
+                }), 429
+            
+            # Add current request
+            rate_limit_storage[client_ip].append(now)
+            
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
+
+def check_memory_usage():
+    """Check memory usage and trigger cleanup if needed"""
+    try:
+        memory_percent = psutil.virtual_memory().percent
+        if memory_percent > 80:  # If memory usage > 80%
+            logger.warning(f"High memory usage: {memory_percent}%")
+            cleanup_old_downloads(force=True)
+            gc.collect()  # Force garbage collection
+            return True
+    except Exception as e:
+        logger.error(f"Memory check failed: {e}")
+    return False
+
+def cleanup_old_downloads(force=False, max_age=1800):  # 30 minutes default
+    """Aggressive cleanup for free tier"""
+    try:
+        current_time = time.time()
+        to_delete = []
+        
+        for job_id, status_info in download_status.items():
+            # More aggressive cleanup on free tier
+            age_limit = 300 if force else max_age  # 5 min if forced, 30 min otherwise
+            
+            if current_time - status_info.get('created_at', current_time) > age_limit:
+                to_delete.append(job_id)
+        
+        for job_id in to_delete:
+            cleanup_download(job_id, silent=True)
+        
+        if to_delete:
+            logger.info(f"Cleaned up {len(to_delete)} old downloads")
+            
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+
+def check_system_resources():
+    """Check if system has enough resources for download"""
+    global active_downloads
+    
+    if active_downloads >= MAX_CONCURRENT_DOWNLOADS:
+        return False, "Too many concurrent downloads. Try again later."
+    
+    # Check memory
+    if check_memory_usage():
+        return False, "Server is under high load. Try again later."
+    
+    # Check disk space (free tier has limited disk)
+    try:
+        disk_usage = psutil.disk_usage('/tmp')
+        free_gb = disk_usage.free / (1024**3)
+        if free_gb < 0.5:  # Less than 500MB free
+            cleanup_old_downloads(force=True)
+            disk_usage = psutil.disk_usage('/tmp')
+            free_gb = disk_usage.free / (1024**3)
+            if free_gb < 0.2:  # Still less than 200MB
+                return False, "Insufficient disk space. Try again later."
+    except Exception as e:
+        logger.error(f"Disk check failed: {e}")
+    
+    return True, "OK"
 
 @app.route('/', methods=['GET'])
 def health_check():
-    """Health check endpoint for Render.com"""
-    return jsonify({"status": "healthy", "service": "youtube-audio-downloader"}), 200
+    """Enhanced health check with system status"""
+    try:
+        memory_percent = psutil.virtual_memory().percent
+        disk_usage = psutil.disk_usage('/tmp')
+        free_gb = disk_usage.free / (1024**3)
+        
+        status = {
+            "status": "healthy",
+            "service": "youtube-audio-downloader",
+            "active_downloads": active_downloads,
+            "memory_usage": f"{memory_percent:.1f}%",
+            "free_disk_gb": f"{free_gb:.2f}",
+            "total_jobs": len(download_status)
+        }
+        
+        if memory_percent > 90 or free_gb < 0.1:
+            status["status"] = "degraded"
+            
+        return jsonify(status), 200
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({"status": "healthy", "service": "youtube-audio-downloader"}), 200
 
 @app.route('/download/audio/ultrafast', methods=['POST'])
+@rate_limit(max_requests=5, window=300)  # Stricter rate limiting
 def download_audio_ultrafast():
-    """Ultra-fast download prioritizing speed over maximum quality (still high quality 256kbps)"""
+    """Ultra-fast download optimized for free tier"""
+    global active_downloads
+    
+    # Check resources first
+    can_proceed, message = check_system_resources()
+    if not can_proceed:
+        return jsonify({"error": message}), 503
+    
     if not request.is_json:
         return jsonify({"error": "Invalid request format. Must be JSON."}), 400
     
@@ -43,221 +171,100 @@ def download_audio_ultrafast():
     if not youtube_url:
         return jsonify({"error": "No URL provided"}), 400
 
-    # Strip the playlist part from the URL if it exists
+    # URL cleaning
     if "&list=" in youtube_url:
         youtube_url = youtube_url.split("&list=")[0]
     
     logger.info(f"Ultra-fast download for URL: {youtube_url}")
-
-    # Create a temporary directory
-    try:
-        if os.path.exists('/tmp') and os.access('/tmp', os.W_OK):
-            temp_dir = tempfile.mkdtemp(dir='/tmp')
-        else:
-            temp_dir = tempfile.mkdtemp(dir='.')
-    except Exception as e:
-        logger.error(f"Could not create temp directory: {e}")
-        return jsonify({"error": "Server storage issue"}), 500
+    
+    active_downloads += 1
+    temp_dir = None
     
     try:
-        # Get paths
+        # Aggressive cleanup before starting
+        cleanup_old_downloads(force=True)
+        
+        # Create temp directory
+        temp_dir = tempfile.mkdtemp(dir='/tmp', prefix='yt_')
+        
         script_dir = os.path.dirname(os.path.abspath(__file__))
         cookie_path = os.path.join(script_dir, 'cookies.txt')
         proxy_url = os.environ.get('HTTP_PROXY')
 
-        # Ultra-speed optimized options (still good quality)
+        # Ultra-optimized options for free tier
         ydl_opts = {
-            # Prioritize already-compressed formats to minimize conversion time
-            'format': 'bestaudio[abr<=256][abr>=128]/bestaudio[ext=m4a][abr<=256]/bestaudio[ext=webm][abr<=256]/bestaudio',
+            # Most aggressive format selection for speed
+            'format': 'worstaudio[abr>=96]/bestaudio[abr<=128]/bestaudio[ext=m4a][abr<=128]',
             'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '256',  # Still high quality, but faster
+                'preferredquality': '128',  # Lower quality for speed on free tier
             }],
             'postprocessor_args': [
-                '-ar', '44100',
-                '-ac', '2',
-                '-b:a', '256k',
-                '-threads', '0',           # Use all cores
-                '-preset', 'superfast',    # Even faster preset
-                '-tune', 'fastdecode',     # Optimize for speed
+                '-ar', '22050',           # Lower sample rate for speed
+                '-ac', '1',               # Mono for smaller size
+                '-b:a', '128k',
+                '-threads', '1',          # Limited threads on free tier
+                '-preset', 'ultrafast',
             ],
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
             
-            # Maximum speed settings
-            'concurrent_fragment_downloads': 6,   # More parallel downloads
-            'http_chunk_size': 2097152,          # 2MB chunks
-            'buffer_size': 32768,                # Even larger buffer
+            # Maximum speed settings for free tier
+            'concurrent_fragment_downloads': 2,  # Reduced for free tier
+            'http_chunk_size': 512000,           # Smaller chunks
+            'buffer_size': 8192,                 # Smaller buffer
             'no_color': True,
-            'quiet': True,                       # Minimize output processing
+            'quiet': True,
             'no_warnings': True,
             
-            # Minimal retry for speed
-            'socket_timeout': 15,
-            'fragment_retries': 0,               # No retries for maximum speed
+            # Minimal retry for maximum speed
+            'socket_timeout': 10,                # Shorter timeout
+            'fragment_retries': 0,
             'retries': 0,
             'extractor_retries': 0,
             
-            # Skip unnecessary operations
+            # Skip all unnecessary operations
             'writesubtitles': False,
             'writeautomaticsub': False,
             'embed_subs': False,
             'writeinfojson': False,
             'writethumbnail': False,
             'extract_flat': False,
+            'no_check_certificate': True,        # Skip cert verification for speed
         }
 
-        # Add cookies and proxy if available
         if os.path.exists(cookie_path):
             ydl_opts['cookiefile'] = cookie_path
         if proxy_url:
             ydl_opts['proxy'] = proxy_url
 
-        # Single attempt for maximum speed
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                logger.info("Starting ultra-fast download...")
                 ydl.download([youtube_url])
                 
-                # Find the downloaded file quickly
+                # Find and return file immediately
                 for pattern in ['*.mp3', '*.m4a', '*.webm']:
                     found_files = list(Path(temp_dir).glob(pattern))
                     if found_files:
                         file_path = str(found_files[0])
-                        logger.info(f"Ultra-fast download successful: {file_path}")
-                        
                         safe_filename = f"audio_ultrafast_{int(time.time())}.mp3"
                         
-                        return send_file(
-                            file_path, 
-                            as_attachment=True, 
-                            download_name=safe_filename,
-                            mimetype='audio/mpeg'
-                        )
-                
-                return jsonify({"error": "Download completed but no audio file was created"}), 500
-        
-        except Exception as e:
-            error_str = str(e).lower()
-            logger.error(f"Ultra-fast download failed: {e}")
-            
-            if "429" in error_str or "too many requests" in error_str:
-                return jsonify({"error": "Rate limited. Try again in a few minutes."}), 429
-            elif any(phrase in error_str for phrase in ["unavailable", "private", "deleted"]):
-                return jsonify({"error": "Video is unavailable or private"}), 400
-            else:
-                return jsonify({"error": f"Download failed: {str(e)}"}), 500
-    
-    finally:
-        # Clean up
-        try:
-            import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
-
-@app.route('/download/audio/fast', methods=['POST'])
-def download_audio_fast():
-    """Fast download with high quality audio"""
-    if not request.is_json:
-        return jsonify({"error": "Invalid request format. Must be JSON."}), 400
-    
-    data = request.json
-    youtube_url = data.get('url')
-
-    if not youtube_url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    # Strip the playlist part from the URL if it exists
-    if "&list=" in youtube_url:
-        youtube_url = youtube_url.split("&list=")[0]
-    
-    # Clean URL further
-    if "?" in youtube_url and "&" in youtube_url:
-        base_url = youtube_url.split("?")[0]
-        params = youtube_url.split("?")[1]
-        if "v=" in params:
-            video_id = params.split("v=")[1].split("&")[0]
-            youtube_url = f"{base_url}?v={video_id}"
-
-    logger.info(f"High-quality fast download for URL: {youtube_url}")
-
-    # Create a temporary directory
-    try:
-        if os.path.exists('/tmp') and os.access('/tmp', os.W_OK):
-            temp_dir = tempfile.mkdtemp(dir='/tmp')
-        else:
-            temp_dir = tempfile.mkdtemp(dir='.')
-    except Exception as e:
-        logger.error(f"Could not create temp directory: {e}")
-        return jsonify({"error": "Server storage issue"}), 500
-    
-    try:
-        # Get paths
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        cookie_path = os.path.join(script_dir, 'cookies.txt')
-        
-        # Get proxy from environment
-        proxy_url = os.environ.get('HTTP_PROXY')
-
-        # Speed-optimized high-quality yt-dlp options
-        ydl_opts = {
-            # Prioritize formats that are already high quality and need minimal conversion
-            'format': 'bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio[ext=m4a]/bestaudio[abr>=160]/bestaudio',
-            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '320',
-            }],
-            'postprocessor_args': [
-                '-ar', '44100',    # Standard high quality (48kHz can be slower)
-                '-ac', '2',        # Stereo
-                '-b:a', '320k',    # High bitrate
-                '-threads', '0',   # Use all CPU cores for encoding
-                '-preset', 'ultrafast',  # Fastest encoding preset
-            ],
-            'prefer_ffmpeg': True,
-            'keepvideo': False,
-            'noplaylist': True,
-            
-            # Speed optimizations
-            'concurrent_fragment_downloads': 4,  # Download fragments in parallel
-            'http_chunk_size': 1048576,          # 1MB chunks for faster download
-            'buffer_size': 16384,                # Larger buffer
-            'no_color': True,                    # Reduce output processing
-            'no_warnings': True,
-            
-            # Network optimizations
-            'socket_timeout': 20,
-            'fragment_retries': 1,               # Reduce retries for speed
-            'retries': 1,
-            'extractor_retries': 1,
-        }
-
-        # Add cookies and proxy if available
-        if os.path.exists(cookie_path):
-            ydl_opts['cookiefile'] = cookie_path
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
-
-        # Single attempt for speed
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                logger.info("Starting fast download...")
-                ydl.download([youtube_url])
-                
-                # Find the downloaded file quickly
-                for pattern in ['*.mp3', '*.m4a', '*.webm']:
-                    found_files = list(Path(temp_dir).glob(pattern))
-                    if found_files:
-                        file_path = str(found_files[0])
-                        logger.info(f"Fast download successful: {file_path}")
+                        def cleanup_after_send():
+                            """Cleanup after file is sent"""
+                            time.sleep(30)  # Wait 30 seconds
+                            try:
+                                import shutil
+                                shutil.rmtree(temp_dir, ignore_errors=True)
+                            except Exception as e:
+                                logger.error(f"Cleanup error: {e}")
                         
-                        safe_filename = f"audio_hq_{int(time.time())}.mp3"
+                        # Schedule cleanup
+                        cleanup_thread = threading.Thread(target=cleanup_after_send)
+                        cleanup_thread.daemon = True
+                        cleanup_thread.start()
                         
                         return send_file(
                             file_path, 
@@ -270,8 +277,6 @@ def download_audio_fast():
         
         except Exception as e:
             error_str = str(e).lower()
-            logger.error(f"Fast download failed: {e}")
-            
             if "429" in error_str or "too many requests" in error_str:
                 return jsonify({"error": "Rate limited. Try again in a few minutes."}), 429
             elif any(phrase in error_str for phrase in ["unavailable", "private", "deleted"]):
@@ -280,16 +285,23 @@ def download_audio_fast():
                 return jsonify({"error": f"Download failed: {str(e)}"}), 500
     
     finally:
-        # Clean up
-        try:
-            import shutil
-            shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+        active_downloads -= 1
+        # Cleanup temp directory if still exists
+        if temp_dir:
+            try:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                logger.error(f"Final cleanup error: {e}")
 
 @app.route('/download/audio/async', methods=['POST'])
+@rate_limit(max_requests=3, window=600)  # Very strict for async
 def download_audio_async():
-    """Start async download and return job ID"""
+    """Async download with better resource management"""
+    can_proceed, message = check_system_resources()
+    if not can_proceed:
+        return jsonify({"error": message}), 503
+    
     if not request.is_json:
         return jsonify({"error": "Invalid request format. Must be JSON."}), 400
     
@@ -299,18 +311,19 @@ def download_audio_async():
     if not youtube_url:
         return jsonify({"error": "No URL provided"}), 400
 
-    # Generate unique job ID
+    # Cleanup before starting new download
+    cleanup_old_downloads()
+
     job_id = str(uuid.uuid4())
     
-    # Initialize status
     download_status[job_id] = {
         'status': 'started',
         'progress': 0,
-        'message': 'Download started'
+        'message': 'Download queued',
+        'created_at': time.time()
     }
     
-    # Start download in background thread
-    thread = threading.Thread(target=background_download, args=(job_id, youtube_url))
+    thread = threading.Thread(target=background_download_optimized, args=(job_id, youtube_url))
     thread.daemon = True
     thread.start()
     
@@ -318,113 +331,81 @@ def download_audio_async():
         "job_id": job_id,
         "status": "started",
         "check_url": f"/download/status/{job_id}",
-        "download_url": f"/download/file/{job_id}"
+        "download_url": f"/download/file/{job_id}",
+        "note": "Files auto-delete after 30 minutes on free tier"
     }), 202
 
-@app.route('/download/status/<job_id>', methods=['GET'])
-def check_download_status(job_id):
-    """Check the status of an async download"""
-    if job_id not in download_status:
-        return jsonify({"error": "Job not found"}), 404
+def background_download_optimized(job_id, youtube_url):
+    """Optimized background download for free tier"""
+    global active_downloads
+    active_downloads += 1
+    temp_dir = None
     
-    return jsonify(download_status[job_id])
-
-@app.route('/download/file/<job_id>', methods=['GET'])
-def get_download_file(job_id):
-    """Get the downloaded file"""
-    if job_id not in download_status:
-        return jsonify({"error": "Job not found"}), 404
-    
-    status = download_status[job_id]
-    if status['status'] != 'completed':
-        return jsonify({"error": "Download not ready", "status": status['status']}), 400
-    
-    if job_id not in download_files:
-        return jsonify({"error": "File not found"}), 404
-    
-    file_path = download_files[job_id]
-    if not os.path.exists(file_path):
-        return jsonify({"error": "File no longer available"}), 404
-    
-    return send_file(
-        file_path,
-        as_attachment=True,
-        download_name=f"audio_hq_{job_id[:8]}.mp3",
-        mimetype='audio/mpeg'
-    )
-
-def background_download(job_id, youtube_url):
-    """Background download function"""
     try:
         # Update status
-        download_status[job_id] = {
+        download_status[job_id].update({
             'status': 'processing',
             'progress': 10,
             'message': 'Processing video URL'
-        }
+        })
         
         # Clean URL
         if "&list=" in youtube_url:
             youtube_url = youtube_url.split("&list=")[0]
         
-        # Create temp directory
-        try:
-            if os.path.exists('/tmp') and os.access('/tmp', os.W_OK):
-                temp_dir = tempfile.mkdtemp(dir='/tmp')
-            else:
-                temp_dir = tempfile.mkdtemp(dir='.')
-        except Exception as e:
-            download_status[job_id] = {
+        # Check memory before proceeding
+        if check_memory_usage():
+            download_status[job_id].update({
                 'status': 'failed',
                 'progress': 0,
-                'message': f'Storage error: {str(e)}'
-            }
+                'message': 'Server overloaded. Try again later.'
+            })
             return
         
-        download_status[job_id]['progress'] = 25
-        download_status[job_id]['message'] = 'Downloading audio...'
+        temp_dir = tempfile.mkdtemp(dir='/tmp', prefix='yt_async_')
         
-        # Download configuration
+        download_status[job_id].update({
+            'progress': 25,
+            'message': 'Downloading audio...'
+        })
+        
         script_dir = os.path.dirname(os.path.abspath(__file__))
         cookie_path = os.path.join(script_dir, 'cookies.txt')
         proxy_url = os.environ.get('HTTP_PROXY')
         
+        # Free tier optimized settings
         ydl_opts = {
-            # Speed-first format selection prioritizing already high-quality formats
-            'format': 'bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio[ext=m4a]/bestaudio[abr>=160]/bestaudio',
+            'format': 'bestaudio[abr<=192]/bestaudio[ext=m4a][abr<=192]/bestaudio',
             'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '320',
+                'preferredquality': '192',  # Good quality but not excessive
             }],
             'postprocessor_args': [
-                '-ar', '44100',       # Standard high quality (faster than 48kHz)
-                '-ac', '2',           # Stereo
-                '-b:a', '320k',       # High bitrate
-                '-threads', '0',      # Use all available CPU cores
-                '-preset', 'ultrafast',  # Fastest encoding preset
-                '-avoid_negative_ts', 'make_zero',  # Avoid processing delays
+                '-ar', '44100',
+                '-ac', '2',
+                '-b:a', '192k',
+                '-threads', '2',              # Limited threads
+                '-preset', 'fast',            # Balanced preset
             ],
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
             
-            # Advanced speed optimizations
-            'concurrent_fragment_downloads': 4,   # Download fragments in parallel
-            'http_chunk_size': 1048576,          # 1MB chunks
-            'buffer_size': 16384,                # Larger buffer
+            # Free tier network settings
+            'concurrent_fragment_downloads': 2,
+            'http_chunk_size': 1048576,
+            'buffer_size': 16384,
             'no_color': True,
-            'quiet': False,                      # Keep some logging for status updates
-            'no_warnings': False,
+            'quiet': False,
             
-            # Network optimizations for Render.com
-            'socket_timeout': 25,
-            'fragment_retries': 1,               # Minimal retries for speed
+            # Conservative timeouts for free tier
+            'socket_timeout': 30,
+            'fragment_retries': 1,
             'retries': 1,
             'extractor_retries': 1,
             
-            # Additional optimizations
             'writesubtitles': False,
             'writeautomaticsub': False,
             'embed_subs': False,
@@ -437,8 +418,10 @@ def background_download(job_id, youtube_url):
         if proxy_url:
             ydl_opts['proxy'] = proxy_url
         
-        download_status[job_id]['progress'] = 50
-        download_status[job_id]['message'] = 'Converting to MP3...'
+        download_status[job_id].update({
+            'progress': 50,
+            'message': 'Converting to MP3...'
+        })
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([youtube_url])
@@ -450,22 +433,23 @@ def background_download(job_id, youtube_url):
                     file_path = str(found_files[0])
                     download_files[job_id] = file_path
                     
-                    download_status[job_id] = {
+                    download_status[job_id].update({
                         'status': 'completed',
                         'progress': 100,
                         'message': 'Download completed successfully'
-                    }
+                    })
                     
-                    # Clean up after 1 hour
-                    threading.Timer(3600, cleanup_download, args=(job_id,)).start()
+                    # Shorter cleanup time for free tier
+                    cleanup_timer = threading.Timer(1800, cleanup_download, args=(job_id,))
+                    cleanup_timer.daemon = True
+                    cleanup_timer.start()
                     return
             
-            # No file found
-            download_status[job_id] = {
+            download_status[job_id].update({
                 'status': 'failed',
                 'progress': 0,
                 'message': 'No audio file was created'
-            }
+            })
     
     except Exception as e:
         error_msg = str(e).lower()
@@ -476,219 +460,179 @@ def background_download(job_id, youtube_url):
         else:
             message = f"Download failed: {str(e)}"
         
-        download_status[job_id] = {
+        download_status[job_id].update({
             'status': 'failed',
             'progress': 0,
             'message': message
-        }
-        
-        # Clean up temp directory
-        try:
-            import shutil
-            if 'temp_dir' in locals():
+        })
+    
+    finally:
+        active_downloads -= 1
+        # Cleanup temp directory on failure
+        if temp_dir and job_id not in download_files:
+            try:
+                import shutil
                 shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+            except Exception as e:
+                logger.error(f"Background cleanup error: {e}")
 
-def cleanup_download(job_id):
-    """Clean up download files and status after timeout"""
+@app.route('/download/status/<job_id>', methods=['GET'])
+def check_download_status(job_id):
+    """Check download status with auto-cleanup"""
+    if job_id not in download_status:
+        return jsonify({"error": "Job not found or expired"}), 404
+    
+    status = download_status[job_id].copy()
+    
+    # Add time remaining info
+    if 'created_at' in status:
+        age = time.time() - status['created_at']
+        remaining = max(0, 1800 - age)  # 30 minutes total
+        status['expires_in_seconds'] = int(remaining)
+    
+    return jsonify(status)
+
+@app.route('/download/file/<job_id>', methods=['GET'])
+def get_download_file(job_id):
+    """Get downloaded file with automatic cleanup"""
+    if job_id not in download_status:
+        return jsonify({"error": "Job not found or expired"}), 404
+    
+    status = download_status[job_id]
+    if status['status'] != 'completed':
+        return jsonify({"error": "Download not ready", "status": status['status']}), 400
+    
+    if job_id not in download_files:
+        return jsonify({"error": "File expired or not found"}), 404
+    
+    file_path = download_files[job_id]
+    if not os.path.exists(file_path):
+        cleanup_download(job_id, silent=True)
+        return jsonify({"error": "File no longer available"}), 404
+    
+    # Schedule cleanup after download
+    def delayed_cleanup():
+        time.sleep(60)  # Wait 1 minute
+        cleanup_download(job_id, silent=True)
+    
+    cleanup_thread = threading.Thread(target=delayed_cleanup)
+    cleanup_thread.daemon = True
+    cleanup_thread.start()
+    
+    return send_file(
+        file_path,
+        as_attachment=True,
+        download_name=f"audio_hq_{job_id[:8]}.mp3",
+        mimetype='audio/mpeg'
+    )
+
+def cleanup_download(job_id, silent=False):
+    """Clean up download files and status"""
     try:
         if job_id in download_files:
             file_path = download_files[job_id]
             if os.path.exists(file_path):
-                os.remove(file_path)
+                # Remove file and parent temp directory
+                parent_dir = os.path.dirname(file_path)
+                import shutil
+                shutil.rmtree(parent_dir, ignore_errors=True)
             del download_files[job_id]
         
         if job_id in download_status:
             del download_status[job_id]
             
-        logger.info(f"Cleaned up download {job_id}")
+        if not silent:
+            logger.info(f"Cleaned up download {job_id}")
     except Exception as e:
-        logger.error(f"Cleanup error for {job_id}: {e}")
+        if not silent:
+            logger.error(f"Cleanup error for {job_id}: {e}")
 
-# Keep the original endpoint for compatibility
+# Keep original endpoint for compatibility
 @app.route('/download/audio', methods=['POST'])
+@rate_limit()
 def download_audio():
-    """Original endpoint - redirects to async download for reliability"""
-    return download_audio_async()
+    """Original endpoint - redirects to ultrafast for free tier"""
+    return download_audio_ultrafast()
 
-@app.route('/download/audio/lossless', methods=['POST']) 
+@app.route('/download/audio/fast', methods=['POST'])
+@rate_limit()
+def download_audio_fast():
+    """Fast download endpoint - optimized for free tier"""
+    return download_audio_ultrafast()  # Use ultrafast on free tier
+
+# Disabled endpoint for free tier
+@app.route('/download/audio/lossless', methods=['POST'])
 def download_audio_lossless():
-    """Download in original format (no conversion) for best quality"""
-    if not request.is_json:
-        return jsonify({"error": "Invalid request format. Must be JSON."}), 400
-    
-    data = request.json
-    youtube_url = data.get('url')
-
-    if not youtube_url:
-        return jsonify({"error": "No URL provided"}), 400
-
-    # Generate unique job ID for lossless download
-    job_id = str(uuid.uuid4())
-    
-    download_status[job_id] = {
-        'status': 'started',
-        'progress': 0,
-        'message': 'Starting lossless download'
-    }
-    
-    # Start lossless download in background
-    thread = threading.Thread(target=background_lossless_download, args=(job_id, youtube_url))
-    thread.daemon = True
-    thread.start()
-    
+    """Lossless downloads - not available on free tier"""
     return jsonify({
-        "job_id": job_id,
-        "status": "started", 
-        "message": "Lossless download started (no compression)",
-        "check_url": f"/download/status/{job_id}",
-        "download_url": f"/download/file/{job_id}"
-    }), 202
+        "error": "Lossless downloads not available on free tier",
+        "suggestion": "Use /download/audio/ultrafast for fastest downloads"
+    }), 403
 
-def background_lossless_download(job_id, youtube_url):
-    """Download original audio without any compression"""
-    try:
-        download_status[job_id] = {
-            'status': 'processing',
-            'progress': 10,
-            'message': 'Getting best quality audio...'
-        }
-        
-        if "&list=" in youtube_url:
-            youtube_url = youtube_url.split("&list=")[0]
-        
+def periodic_cleanup():
+    """Run periodic cleanup every 10 minutes"""
+    while True:
         try:
-            if os.path.exists('/tmp') and os.access('/tmp', os.W_OK):
-                temp_dir = tempfile.mkdtemp(dir='/tmp')
-            else:
-                temp_dir = tempfile.mkdtemp(dir='.')
+            time.sleep(600)  # 10 minutes
+            cleanup_old_downloads()
+            gc.collect()
+            logger.info("Periodic cleanup completed")
         except Exception as e:
-            download_status[job_id] = {
-                'status': 'failed',
-                'progress': 0,
-                'message': f'Storage error: {str(e)}'
-            }
-            return
-        
-        download_status[job_id]['progress'] = 30
-        download_status[job_id]['message'] = 'Downloading original audio...'
-        
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        cookie_path = os.path.join(script_dir, 'cookies.txt')
-        proxy_url = os.environ.get('HTTP_PROXY')
-        
-        # Lossless download - no conversion
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',  # Keep original format
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-            # No postprocessors = no quality loss
-            'prefer_ffmpeg': True,
-            'noplaylist': True,
-            'socket_timeout': 45,
-            'fragment_retries': 3,
-            'retries': 3,
-        }
-        
-        if os.path.exists(cookie_path):
-            ydl_opts['cookiefile'] = cookie_path
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
-        
-        download_status[job_id]['progress'] = 70
-        download_status[job_id]['message'] = 'Processing lossless audio...'
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([youtube_url])
-            
-            # Find downloaded file (could be m4a, webm, etc.)
-            for pattern in ['*.m4a', '*.webm', '*.opus', '*.mp3']:
-                found_files = list(Path(temp_dir).glob(pattern))
-                if found_files:
-                    file_path = str(found_files[0])
-                    download_files[job_id] = file_path
-                    
-                    # Get the actual format
-                    file_ext = Path(file_path).suffix
-                    
-                    download_status[job_id] = {
-                        'status': 'completed',
-                        'progress': 100,
-                        'message': f'Lossless download completed ({file_ext} format)'
-                    }
-                    
-                    threading.Timer(3600, cleanup_download, args=(job_id,)).start()
-                    return
-            
-            download_status[job_id] = {
-                'status': 'failed',
-                'progress': 0,
-                'message': 'No audio file was created'
-            }
-    
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "429" in error_msg:
-            message = "Rate limited. Try again later."
-        elif any(phrase in error_msg for phrase in ["unavailable", "private", "deleted"]):
-            message = "Video unavailable or private"
-        else:
-            message = f"Download failed: {str(e)}"
-        
-        download_status[job_id] = {
-            'status': 'failed',
-            'progress': 0,
-            'message': message
-        }
-        
-        try:
-            import shutil
-            if 'temp_dir' in locals():
-                shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+            logger.error(f"Periodic cleanup error: {e}")
 
 @app.errorhandler(Exception)
 def handle_error(e):
     logger.error(f"Unhandled error: {e}")
     return jsonify({"error": "Internal server error"}), 500
 
+@app.errorhandler(413)
+def handle_file_too_large(e):
+    return jsonify({
+        "error": "File too large for free tier",
+        "limit": "100MB maximum"
+    }), 413
+
 if __name__ == '__main__':
-    # Get port from environment variable (Render.com requirement)
     port = int(os.environ.get('PORT', 8080))
     
-    # Optimize for maximum performance on Render.com
-    import os
-    # Set FFmpeg thread count to use all available cores
-    os.environ['FFMPEG_THREADS'] = '0'
-    # Optimize memory usage
-    os.environ['MALLOC_ARENA_MAX'] = '2'
+    # Free tier optimizations
+    os.environ['FFMPEG_THREADS'] = '2'      # Limited threads
+    os.environ['MALLOC_ARENA_MAX'] = '1'    # Minimize memory usage
     
-    # Check if ffmpeg is available
-    import subprocess
+    # Start background cleanup thread
+    cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+    cleanup_thread.start()
+    
+    # System checks
     try:
+        import subprocess
         result = subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, text=True)
         logger.info("FFmpeg is available")
-        # Log available encoders for optimization
-        if 'libmp3lame' in result.stdout:
-            logger.info("libmp3lame encoder available - optimal MP3 encoding")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.error("FFmpeg not found. This will cause failures on Render.com")
+        logger.error("FFmpeg not found - downloads may fail")
     
-    # Check yt-dlp version
     try:
         logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
-        logger.info("Server optimized for maximum speed + high quality downloads")
-        logger.info("Available endpoints:")
-        logger.info("- /download/audio/ultrafast (256kbps, maximum speed)")
-        logger.info("- /download/audio/fast (320kbps, balanced)")
-        logger.info("- /download/audio/async (320kbps, no timeout)")
-        logger.info("- /download/audio/lossless (original format)")
     except:
-        logger.info("Could not determine yt-dlp version")
+        logger.warning("Could not determine yt-dlp version")
     
-    # Production-ready server settings
+    logger.info("=== YouTube Audio Downloader Server ===")
+    logger.info("Optimized for Render.com FREE TIER")
+    logger.info("Available endpoints:")
+    logger.info("- POST /download/audio/ultrafast (128kbps, maximum speed)")
+    logger.info("- POST /download/audio/async (192kbps, no timeout)")
+    logger.info("- GET  /download/status/{job_id} (check async status)")
+    logger.info("- GET  /download/file/{job_id} (get async file)")
+    logger.info("- GET  / (health check)")
+    logger.info("Features:")
+    logger.info("- Rate limiting active (prevents abuse)")
+    logger.info("- Auto-cleanup every 10 minutes")
+    logger.info("- Files expire after 30 minutes")
+    logger.info("- Max 2 concurrent downloads")
+    logger.info("- Memory and disk monitoring")
+    
     if os.environ.get('RENDER'):
-        logger.info("Running on Render.com with speed optimizations")
-    else:
-        app.run(host='0.0.0.0', port=port, debug=True)
+        logger.info("🚀 Running on Render.com with optimizations enabled")
+    
+    # Run with threading enabled for better performance
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
