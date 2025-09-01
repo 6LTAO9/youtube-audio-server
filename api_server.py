@@ -5,11 +5,14 @@ import threading
 import uuid
 import gc
 import psutil
+import requests
+import random
 from flask import Flask, request, send_file, jsonify
 import yt_dlp
 from pathlib import Path
 import logging
 from functools import wraps
+from urllib.parse import urlparse
 
 # Configure logging for production
 logging.basicConfig(
@@ -33,6 +36,142 @@ MAX_CONCURRENT_DOWNLOADS = 2  # Limit for free tier
 
 # Rate limiting storage (in-memory for free tier)
 rate_limit_storage = {}
+
+# Proxy management
+proxy_list = []
+proxy_last_updated = 0
+proxy_update_interval = 3600  # Update proxies every hour
+current_proxy_index = 0
+proxy_lock = threading.Lock()
+
+# Proxy sources from TheSpeedX/PROXY-List
+PROXY_SOURCES = {
+    'http': [
+        'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
+        'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt',
+        'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt'
+    ]
+}
+
+def fetch_proxies_from_github():
+    """Fetch proxy list from TheSpeedX/PROXY-List repository"""
+    global proxy_list, proxy_last_updated
+    
+    new_proxies = []
+    
+    try:
+        for proxy_type, urls in PROXY_SOURCES.items():
+            for url in urls:
+                try:
+                    logger.info(f"Fetching proxies from: {url}")
+                    response = requests.get(url, timeout=30)
+                    response.raise_for_status()
+                    
+                    # Parse proxy list
+                    proxies = response.text.strip().split('\n')
+                    for proxy in proxies:
+                        proxy = proxy.strip()
+                        if proxy and ':' in proxy:
+                            # Format: ip:port
+                            if proxy_type == 'http':
+                                formatted_proxy = f"http://{proxy}"
+                            elif proxy_type == 'socks4':
+                                formatted_proxy = f"socks4://{proxy}"
+                            elif proxy_type == 'socks5':
+                                formatted_proxy = f"socks5://{proxy}"
+                            else:
+                                formatted_proxy = f"http://{proxy}"
+                            
+                            new_proxies.append(formatted_proxy)
+                    
+                    logger.info(f"Fetched {len(proxies)} proxies from {url}")
+                    
+                except requests.RequestException as e:
+                    logger.warning(f"Failed to fetch proxies from {url}: {e}")
+                    continue
+                except Exception as e:
+                    logger.error(f"Error processing proxy source {url}: {e}")
+                    continue
+        
+        if new_proxies:
+            # Remove duplicates and shuffle
+            unique_proxies = list(set(new_proxies))
+            random.shuffle(unique_proxies)
+            
+            with proxy_lock:
+                proxy_list = unique_proxies
+                proxy_last_updated = time.time()
+            
+            logger.info(f"Updated proxy list with {len(unique_proxies)} unique proxies")
+            return True
+        else:
+            logger.warning("No proxies were fetched from any source")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Critical error fetching proxies: {e}")
+        return False
+
+def test_proxy(proxy, timeout=10):
+    """Test if a proxy is working"""
+    try:
+        test_urls = [
+            'http://httpbin.org/ip',
+            'https://api.ipify.org?format=json',
+            'http://ip-api.com/json'
+        ]
+        
+        proxies = {'http': proxy, 'https': proxy}
+        
+        for test_url in test_urls:
+            try:
+                response = requests.get(test_url, proxies=proxies, timeout=timeout)
+                if response.status_code == 200:
+                    return True
+            except:
+                continue
+        
+        return False
+    except Exception:
+        return False
+
+def get_working_proxy():
+    """Get a working proxy from the list"""
+    global current_proxy_index, proxy_list
+    
+    # Check if we need to update proxy list
+    if time.time() - proxy_last_updated > proxy_update_interval:
+        threading.Thread(target=fetch_proxies_from_github, daemon=True).start()
+    
+    if not proxy_list:
+        logger.warning("No proxies available")
+        return None
+    
+    with proxy_lock:
+        # Try up to 5 proxies before giving up
+        for _ in range(min(5, len(proxy_list))):
+            current_proxy_index = (current_proxy_index + 1) % len(proxy_list)
+            proxy = proxy_list[current_proxy_index]
+            
+            # Quick test (shorter timeout for performance)
+            if test_proxy(proxy, timeout=5):
+                logger.info(f"Using working proxy: {proxy}")
+                return proxy
+            else:
+                logger.debug(f"Proxy not working: {proxy}")
+        
+        logger.warning("No working proxies found in current batch")
+        return None
+
+def update_proxies_periodic():
+    """Periodically update proxy list"""
+    while True:
+        try:
+            time.sleep(proxy_update_interval)
+            logger.info("Starting periodic proxy update...")
+            fetch_proxies_from_github()
+        except Exception as e:
+            logger.error(f"Error in periodic proxy update: {e}")
 
 def rate_limit(max_requests=10, window=300):  # 10 requests per 5 minutes
     """Simple in-memory rate limiting"""
@@ -140,7 +279,9 @@ def health_check():
             "active_downloads": active_downloads,
             "memory_usage": f"{memory_percent:.1f}%",
             "free_disk_gb": f"{free_gb:.2f}",
-            "total_jobs": len(download_status)
+            "total_jobs": len(download_status),
+            "proxy_count": len(proxy_list),
+            "proxy_last_updated": time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime(proxy_last_updated)) if proxy_last_updated else "Never"
         }
         
         if memory_percent > 90 or free_gb < 0.1:
@@ -151,10 +292,106 @@ def health_check():
         logger.error(f"Health check failed: {e}")
         return jsonify({"status": "healthy", "service": "youtube-audio-downloader"}), 200
 
+@app.route('/proxies/refresh', methods=['POST'])
+def refresh_proxies():
+    """Manual proxy refresh endpoint"""
+    success = fetch_proxies_from_github()
+    if success:
+        return jsonify({
+            "status": "success",
+            "proxy_count": len(proxy_list),
+            "message": "Proxy list updated successfully"
+        })
+    else:
+        return jsonify({
+            "status": "error",
+            "message": "Failed to update proxy list"
+        }), 500
+
+def create_ydl_opts_with_proxy(temp_dir, quality='ultrafast'):
+    """Create yt-dlp options with automatic proxy selection"""
+    # Get working proxy
+    proxy_url = get_working_proxy()
+    
+    # Base configuration based on quality
+    if quality == 'ultrafast':
+        ydl_opts = {
+            'format': 'worstaudio[abr>=96]/bestaudio[abr<=128]/bestaudio[ext=m4a][abr<=128]',
+            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '128',
+            }],
+            'postprocessor_args': [
+                '-ar', '22050',
+                '-ac', '1',
+                '-b:a', '128k',
+                '-threads', '1',
+                '-preset', 'ultrafast',
+            ],
+        }
+    else:  # async/high quality
+        ydl_opts = {
+            'format': 'bestaudio[abr<=192]/bestaudio[ext=m4a][abr<=192]/bestaudio',
+            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'postprocessor_args': [
+                '-ar', '44100',
+                '-ac', '2',
+                '-b:a', '192k',
+                '-threads', '2',
+                '-preset', 'fast',
+            ],
+        }
+    
+    # Common options
+    ydl_opts.update({
+        'prefer_ffmpeg': True,
+        'keepvideo': False,
+        'noplaylist': True,
+        'concurrent_fragment_downloads': 2,
+        'http_chunk_size': 512000,
+        'buffer_size': 8192,
+        'no_color': True,
+        'quiet': True,
+        'no_warnings': True,
+        'socket_timeout': 15,
+        'fragment_retries': 1,
+        'retries': 2,
+        'extractor_retries': 1,
+        'writesubtitles': False,
+        'writeautomaticsub': False,
+        'embed_subs': False,
+        'writeinfojson': False,
+        'writethumbnail': False,
+        'extract_flat': False,
+        'no_check_certificate': True,
+    })
+    
+    # Add proxy if available
+    if proxy_url:
+        ydl_opts['proxy'] = proxy_url
+        logger.info(f"Using proxy for download: {proxy_url}")
+    else:
+        logger.info("No proxy available, using direct connection")
+    
+    # Add cookies if available
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cookie_path = os.path.join(script_dir, 'cookies.txt')
+    if os.path.exists(cookie_path):
+        ydl_opts['cookiefile'] = cookie_path
+    
+    return ydl_opts
+
 @app.route('/download/audio/ultrafast', methods=['POST'])
-@rate_limit(max_requests=5, window=300)  # Stricter rate limiting
+@rate_limit(max_requests=5, window=300)
 def download_audio_ultrafast():
-    """Ultra-fast download optimized for free tier"""
+    """Ultra-fast download with automatic proxy selection"""
     global active_downloads
     
     # Check resources first
@@ -187,59 +424,8 @@ def download_audio_ultrafast():
         # Create temp directory
         temp_dir = tempfile.mkdtemp(dir='/tmp', prefix='yt_')
         
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        cookie_path = os.path.join(script_dir, 'cookies.txt')
-        proxy_url = os.environ.get('HTTP_PROXY')
-
-        # Ultra-optimized options for free tier
-        ydl_opts = {
-            # Most aggressive format selection for speed
-            'format': 'worstaudio[abr>=96]/bestaudio[abr<=128]/bestaudio[ext=m4a][abr<=128]',
-            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '128',  # Lower quality for speed on free tier
-            }],
-            'postprocessor_args': [
-                '-ar', '22050',           # Lower sample rate for speed
-                '-ac', '1',               # Mono for smaller size
-                '-b:a', '128k',
-                '-threads', '1',          # Limited threads on free tier
-                '-preset', 'ultrafast',
-            ],
-            'prefer_ffmpeg': True,
-            'keepvideo': False,
-            'noplaylist': True,
-            
-            # Maximum speed settings for free tier
-            'concurrent_fragment_downloads': 2,  # Reduced for free tier
-            'http_chunk_size': 512000,           # Smaller chunks
-            'buffer_size': 8192,                 # Smaller buffer
-            'no_color': True,
-            'quiet': True,
-            'no_warnings': True,
-            
-            # Minimal retry for maximum speed
-            'socket_timeout': 10,                # Shorter timeout
-            'fragment_retries': 0,
-            'retries': 0,
-            'extractor_retries': 0,
-            
-            # Skip all unnecessary operations
-            'writesubtitles': False,
-            'writeautomaticsub': False,
-            'embed_subs': False,
-            'writeinfojson': False,
-            'writethumbnail': False,
-            'extract_flat': False,
-            'no_check_certificate': True,        # Skip cert verification for speed
-        }
-
-        if os.path.exists(cookie_path):
-            ydl_opts['cookiefile'] = cookie_path
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+        # Create yt-dlp options with automatic proxy
+        ydl_opts = create_ydl_opts_with_proxy(temp_dir, 'ultrafast')
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -295,9 +481,9 @@ def download_audio_ultrafast():
                 logger.error(f"Final cleanup error: {e}")
 
 @app.route('/download/audio/async', methods=['POST'])
-@rate_limit(max_requests=3, window=600)  # Very strict for async
+@rate_limit(max_requests=3, window=600)
 def download_audio_async():
-    """Async download with better resource management"""
+    """Async download with automatic proxy selection"""
     can_proceed, message = check_system_resources()
     if not can_proceed:
         return jsonify({"error": message}), 503
@@ -336,7 +522,7 @@ def download_audio_async():
     }), 202
 
 def background_download_optimized(job_id, youtube_url):
-    """Optimized background download for free tier"""
+    """Optimized background download with automatic proxy"""
     global active_downloads
     active_downloads += 1
     temp_dir = None
@@ -369,54 +555,8 @@ def background_download_optimized(job_id, youtube_url):
             'message': 'Downloading audio...'
         })
         
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        cookie_path = os.path.join(script_dir, 'cookies.txt')
-        proxy_url = os.environ.get('HTTP_PROXY')
-        
-        # Free tier optimized settings
-        ydl_opts = {
-            'format': 'bestaudio[abr<=192]/bestaudio[ext=m4a][abr<=192]/bestaudio',
-            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',  # Good quality but not excessive
-            }],
-            'postprocessor_args': [
-                '-ar', '44100',
-                '-ac', '2',
-                '-b:a', '192k',
-                '-threads', '2',              # Limited threads
-                '-preset', 'fast',            # Balanced preset
-            ],
-            'prefer_ffmpeg': True,
-            'keepvideo': False,
-            'noplaylist': True,
-            
-            # Free tier network settings
-            'concurrent_fragment_downloads': 2,
-            'http_chunk_size': 1048576,
-            'buffer_size': 16384,
-            'no_color': True,
-            'quiet': False,
-            
-            # Conservative timeouts for free tier
-            'socket_timeout': 30,
-            'fragment_retries': 1,
-            'retries': 1,
-            'extractor_retries': 1,
-            
-            'writesubtitles': False,
-            'writeautomaticsub': False,
-            'embed_subs': False,
-            'writeinfojson': False,
-            'writethumbnail': False,
-        }
-        
-        if os.path.exists(cookie_path):
-            ydl_opts['cookiefile'] = cookie_path
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+        # Create yt-dlp options with automatic proxy
+        ydl_opts = create_ydl_opts_with_proxy(temp_dir, 'async')
         
         download_status[job_id].update({
             'progress': 50,
@@ -599,9 +739,17 @@ if __name__ == '__main__':
     os.environ['FFMPEG_THREADS'] = '2'      # Limited threads
     os.environ['MALLOC_ARENA_MAX'] = '1'    # Minimize memory usage
     
+    # Initialize proxy list on startup
+    logger.info("Initializing proxy list from GitHub...")
+    fetch_proxies_from_github()
+    
     # Start background cleanup thread
     cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
     cleanup_thread.start()
+    
+    # Start proxy update thread
+    proxy_thread = threading.Thread(target=update_proxies_periodic, daemon=True)
+    proxy_thread.start()
     
     # System checks
     try:
@@ -617,19 +765,22 @@ if __name__ == '__main__':
         logger.warning("Could not determine yt-dlp version")
     
     logger.info("=== YouTube Audio Downloader Server ===")
-    logger.info("Optimized for Render.com FREE TIER")
+    logger.info("Optimized for Render.com FREE TIER with AUTO-PROXY")
     logger.info("Available endpoints:")
     logger.info("- POST /download/audio/ultrafast (128kbps, maximum speed)")
     logger.info("- POST /download/audio/async (192kbps, no timeout)")
     logger.info("- GET  /download/status/{job_id} (check async status)")
     logger.info("- GET  /download/file/{job_id} (get async file)")
+    logger.info("- POST /proxies/refresh (manually refresh proxy list)")
     logger.info("- GET  / (health check)")
     logger.info("Features:")
+    logger.info("- Auto-proxy from TheSpeedX/PROXY-List")
     logger.info("- Rate limiting active (prevents abuse)")
     logger.info("- Auto-cleanup every 10 minutes")
     logger.info("- Files expire after 30 minutes")
     logger.info("- Max 2 concurrent downloads")
     logger.info("- Memory and disk monitoring")
+    logger.info(f"- Proxy count: {len(proxy_list)}")
     
     if os.environ.get('RENDER'):
         logger.info("🚀 Running on Render.com with optimizations enabled")
