@@ -31,6 +31,10 @@ def download_audio():
 
             print(f"Checking for cookies file at: {cookie_path}")
 
+            # Get the proxy URL from the environment variable
+            proxy_url = os.environ.get('HTTP_PROXY')
+            print(f"Using proxy: {proxy_url}")
+
             ydl_opts = {
                 'force_single_video': True,
                 'format': 'bestaudio/best',
@@ -48,9 +52,12 @@ def download_audio():
                 'retries': 15,
                 # Set a common user agent to bypass bot detection.
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+                # Use a proxy to bypass IP-based rate limiting. This value will be set from a Render environment variable.
+                'proxy': proxy_url,
                 # Enable geographic bypassing, which can help with bot detection.
                 'geo_bypass': True,
             }
+
             if os.path.exists(cookie_path):
                 print("Cookies file found. Using it for authentication.")
                 ydl_opts['cookiefile'] = cookie_path
