@@ -42,14 +42,14 @@ def download_audio():
                 }],
                 # Add a random delay between requests to avoid rate-limiting (429 errors).
                 'sleep_requests': True,
-                'sleep_interval': (5, 10), # Increased sleep interval for better rate-limiting avoidance
-                'max_sleep_interval': 60, # The maximum sleep interval in seconds
+                'sleep_interval': (5, 10),
+                'max_sleep_interval': 60,
                 # Enable retries with exponential backoff for network-related errors.
                 'retries': 15,
                 # Set a common user agent to bypass bot detection.
                 'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-                # Add a proxy to bypass IP-based rate limiting. Replace with a reliable proxy URL.
-                'proxy': 'http://123.45.67.89:8080',
+                # Enable geographic bypassing, which can help with bot detection.
+                'geo_bypass': True,
             }
             if os.path.exists(cookie_path):
                 print("Cookies file found. Using it for authentication.")
@@ -75,9 +75,16 @@ def download_audio():
                 else:
                     return "Download failed on the server. File not found.", 500
 
+            except yt_dlp.utils.DownloadError as e:
+                if "HTTP Error 429" in str(e):
+                    print("YouTube is temporarily blocking this IP due to too many requests.")
+                    return "YouTube is temporarily blocking your server due to too many requests. Please wait and try again later.", 429
+                else:
+                    print(f"A download error occurred: {e}")
+                    return f"A download error occurred: {e}", 500
             except Exception as e:
-                print(f"An error occurred: {e}")
-                return f"An error occurred: {e}", 500
+                print(f"An unexpected error occurred: {e}")
+                return f"An unexpected error occurred: {e}", 500
 
     return "Invalid request format. Must be JSON.", 400
 
