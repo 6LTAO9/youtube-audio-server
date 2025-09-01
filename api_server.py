@@ -42,17 +42,16 @@ proxy_last_fetched = 0
 PROXY_UPDATE_INTERVAL = 3600  # 1 hour
 
 def get_working_proxy():
-    """Fetch a working proxy from GitHub - simple implementation"""
+    """Fetch a working proxy from GitHub - simple implementation with validation"""
     global current_proxy, proxy_last_fetched
     
     # Check if we need to update proxy (every hour or if no proxy)
     current_time = time.time()
     if (current_time - proxy_last_fetched > PROXY_UPDATE_INTERVAL) or (current_proxy is None):
         try:
-            # Fetch from TheSpeedX/PROXY-List
+            # Fetch from TheSpeedX/PROXY-List (only HTTP for better compatibility)
             proxy_urls = [
-                'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
-                'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt'
+                'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt'
             ]
             
             all_proxies = []
@@ -60,18 +59,26 @@ def get_working_proxy():
                 try:
                     response = requests.get(url, timeout=15)
                     if response.status_code == 200:
-                        proxies = [line.strip() for line in response.text.strip().split('\n') if ':' in line.strip()]
+                        proxies = [line.strip() for line in response.text.strip().split('\n') if ':' in line.strip() and line.strip().count(':') == 1]
                         all_proxies.extend(proxies)
                 except Exception as e:
                     logger.warning(f"Failed to fetch from {url}: {e}")
                     continue
             
             if all_proxies:
-                # Pick a random proxy and format it
-                selected = random.choice(all_proxies)
-                current_proxy = f"http://{selected}"
-                proxy_last_fetched = current_time
-                logger.info(f"Updated proxy: {current_proxy}")
+                # Test a few random proxies to find a working one
+                test_proxies = random.sample(all_proxies, min(3, len(all_proxies)))
+                for proxy in test_proxies:
+                    test_proxy = f"http://{proxy}"
+                    if test_proxy_quick(test_proxy):
+                        current_proxy = test_proxy
+                        proxy_last_fetched = current_time
+                        logger.info(f"Found working proxy: {current_proxy}")
+                        return current_proxy
+                
+                # If no proxy works, disable proxy
+                logger.warning("No working proxies found, using direct connection")
+                current_proxy = None
             else:
                 logger.warning("No proxies fetched, using direct connection")
                 current_proxy = None
@@ -81,6 +88,15 @@ def get_working_proxy():
             current_proxy = None
     
     return current_proxy
+
+def test_proxy_quick(proxy_url, timeout=5):
+    """Quick proxy test"""
+    try:
+        proxies = {'http': proxy_url, 'https': proxy_url}
+        response = requests.get('http://httpbin.org/ip', proxies=proxies, timeout=timeout)
+        return response.status_code == 200
+    except:
+        return False
 
 def rate_limit(max_requests=10, window=300):  # 10 requests per 5 minutes
     """Simple in-memory rate limiting"""
@@ -334,7 +350,56 @@ def download_audio_ultrafast():
         
         except Exception as e:
             error_str = str(e).lower()
-            if "429" in error_str or "too many requests" in error_str:
+            
+            # Handle proxy-related errors
+            if "tunnel connection failed" in error_str or "proxy" in error_str:
+                logger.warning(f"Proxy error detected: {e}")
+                # Disable current proxy and retry with direct connection
+                current_proxy = None
+                logger.info("Retrying with direct connection...")
+                
+                # Remove proxy from options and retry
+                if 'proxy' in ydl_opts:
+                    del ydl_opts['proxy']
+                
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([youtube_url])
+                        
+                        # Find and return file immediately
+                        for pattern in ['*.mp3', '*.m4a', '*.webm']:
+                            found_files = list(Path(temp_dir).glob(pattern))
+                            if found_files:
+                                file_path = str(found_files[0])
+                                safe_filename = f"audio_ultrafast_{int(time.time())}.mp3"
+                                
+                                def cleanup_after_send():
+                                    time.sleep(30)
+                                    try:
+                                        import shutil
+                                        shutil.rmtree(temp_dir, ignore_errors=True)
+                                    except Exception as e:
+                                        logger.error(f"Cleanup error: {e}")
+                                
+                                cleanup_thread = threading.Thread(target=cleanup_after_send)
+                                cleanup_thread.daemon = True
+                                cleanup_thread.start()
+                                
+                                return send_file(
+                                    file_path, 
+                                    as_attachment=True, 
+                                    download_name=safe_filename,
+                                    mimetype='audio/mpeg'
+                                )
+                        
+                        return jsonify({"error": "Download completed but no audio file was created"}), 500
+                
+                except Exception as retry_error:
+                    logger.error(f"Direct connection also failed: {retry_error}")
+                    return jsonify({"error": f"Download failed even with direct connection: {str(retry_error)}"}), 500
+            
+            # Handle other errors
+            elif "429" in error_str or "too many requests" in error_str:
                 return jsonify({"error": "Rate limited. Try again in a few minutes."}), 429
             elif any(phrase in error_str for phrase in ["unavailable", "private", "deleted"]):
                 return jsonify({"error": "Video is unavailable or private"}), 400
