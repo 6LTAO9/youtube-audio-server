@@ -8,11 +8,22 @@ import json
 from pathlib import Path
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging for production
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# Render.com specific configurations
+app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024  # 500MB max file size
+
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint for Render.com"""
+    return jsonify({"status": "healthy", "service": "youtube-audio-downloader"}), 200
 
 @app.route('/download/audio', methods=['POST'])
 def download_audio():
@@ -40,8 +51,16 @@ def download_audio():
 
     logger.info(f"Processing URL: {youtube_url}")
 
-    # Create a temporary directory
-    temp_dir = tempfile.mkdtemp()
+    # Create a temporary directory (Render.com has limited /tmp space)
+    try:
+        # Try to use /tmp first, fallback to current directory
+        if os.path.exists('/tmp') and os.access('/tmp', os.W_OK):
+            temp_dir = tempfile.mkdtemp(dir='/tmp')
+        else:
+            temp_dir = tempfile.mkdtemp(dir='.')
+    except Exception as e:
+        logger.error(f"Could not create temp directory: {e}")
+        return jsonify({"error": "Server storage issue"}), 500
     
     try:
         # Get paths
@@ -55,14 +74,14 @@ def download_audio():
         if proxy_url:
             logger.info(f"Using proxy: {proxy_url}")
 
-        # Minimal yt-dlp options to avoid tuple comparison bug
+        # Render.com optimized yt-dlp options
         ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+            'format': 'bestaudio[filesize<50M]/bestaudio',  # Limit file size for Render
+            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),  # Simple filename
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '192',
+                'preferredquality': '128',  # Lower quality for faster processing
             }],
             'prefer_ffmpeg': True,
             'keepvideo': False,
@@ -71,6 +90,10 @@ def download_audio():
             'audioformat': 'mp3',
             'ignoreerrors': False,
             'noplaylist': True,
+            # Render.com timeout considerations
+            'socket_timeout': 30,
+            'fragment_retries': 3,
+            'retries': 3,
         }
 
         # Add cookies if available
@@ -84,7 +107,7 @@ def download_audio():
         if proxy_url:
             ydl_opts['proxy'] = proxy_url
 
-        max_attempts = 3
+        max_attempts = 2  # Reduced for Render.com timeout limits
         
         for attempt in range(1, max_attempts + 1):
             logger.info(f"Download attempt {attempt}/{max_attempts}")
@@ -142,12 +165,8 @@ def download_audio():
                         file_path = str(downloaded_files[0])
                         logger.info(f"Download successful: {file_path}")
                         
-                        # Get original filename for download
-                        original_name = info.get('title', 'audio') + '.mp3'
-                        # Clean filename for download
-                        safe_filename = "".join(c for c in original_name if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
-                        if not safe_filename.endswith('.mp3'):
-                            safe_filename += '.mp3'
+                        # Get a simple filename for download
+                        safe_filename = f"audio_{int(time.time())}.mp3"
                         
                         return send_file(
                             file_path, 
@@ -248,13 +267,16 @@ def handle_error(e):
 
 
 if __name__ == '__main__':
+    # Get port from environment variable (Render.com requirement)
+    port = int(os.environ.get('PORT', 8080))
+    
     # Check if ffmpeg is available
     import subprocess
     try:
         subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
         logger.info("FFmpeg is available")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.warning("FFmpeg not found. Audio conversion may not work properly.")
+        logger.error("FFmpeg not found. This will cause failures on Render.com")
     
     # Check yt-dlp version
     try:
@@ -262,4 +284,10 @@ if __name__ == '__main__':
     except:
         logger.info("Could not determine yt-dlp version")
     
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    # Production-ready server settings
+    if os.environ.get('RENDER'):
+        # Running on Render.com - use gunicorn (configured in start command)
+        logger.info("Running on Render.com")
+    else:
+        # Local development
+        app.run(host='0.0.0.0', port=port, debug=True)
