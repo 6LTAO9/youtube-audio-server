@@ -3,3 +3,4 @@ yt-dlp>=2023.9.24
 psutil==5.9.5
 requests==2.31.0
 pathlib
+gunicorn==21.2.0
