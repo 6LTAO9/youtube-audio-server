@@ -55,9 +55,9 @@ def download_audio():
         if proxy_url:
             logger.info(f"Using proxy: {proxy_url}")
 
-        # Enhanced yt-dlp options - minimal config to avoid tuple comparison bug
+        # Minimal yt-dlp options to avoid tuple comparison bug
         ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',
+            'format': 'bestaudio/best',
             'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
@@ -66,42 +66,11 @@ def download_audio():
             }],
             'prefer_ffmpeg': True,
             'keepvideo': False,
-            
-            # Minimal retry settings to avoid type comparison issues
-            'retries': 10,
-            'fragment_retries': 10,
-            'skip_unavailable_fragments': True,
-            
-            # Headers and user agent
-            'http_headers': {
-                'User-Agent': random.choice([
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-                ]),
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'DNT': '1',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'none',
-                'Sec-Fetch-User': '?1',
-            },
-            
-            # Network settings
-            'socket_timeout': 30,
-            'nocheckcertificate': True,
-            'prefer_free_formats': True,
             'no_warnings': False,
             'extractaudio': True,
             'audioformat': 'mp3',
-            'embed_subs': False,
-            'writesubtitles': False,
-            'writeautomaticsub': False,
             'ignoreerrors': False,
+            'noplaylist': True,
         }
 
         # Add cookies if available
@@ -115,40 +84,61 @@ def download_audio():
         if proxy_url:
             ydl_opts['proxy'] = proxy_url
 
-        # Add random initial delay
-        initial_delay = random.uniform(1, 5)
-        logger.info(f"Initial delay: {initial_delay:.2f} seconds")
-        time.sleep(initial_delay)
-
         max_attempts = 3
         
         for attempt in range(1, max_attempts + 1):
             logger.info(f"Download attempt {attempt}/{max_attempts}")
             
             try:
+                # Add random delay between attempts (but not using yt-dlp's sleep settings)
+                if attempt > 1:
+                    delay = random.uniform(5, 15)
+                    logger.info(f"Waiting {delay:.1f} seconds before attempt {attempt}")
+                    time.sleep(delay)
+                
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    # Extract info first to validate URL
-                    info = ydl.extract_info(youtube_url, download=False)
-                    if not info:
-                        return jsonify({"error": "Could not extract video information"}), 400
+                    # Try to extract info first
+                    try:
+                        info = ydl.extract_info(youtube_url, download=False)
+                        if not info:
+                            logger.error("Could not extract video information")
+                            if attempt < max_attempts:
+                                continue
+                            return jsonify({"error": "Could not extract video information"}), 400
+                        
+                        # Check availability
+                        availability = info.get('availability')
+                        if availability in ['private', 'premium_only', 'subscriber_only', 'needs_auth']:
+                            return jsonify({"error": f"Video is not available: {availability}"}), 400
+                        
+                        logger.info(f"Video info extracted: {info.get('title', 'Unknown')}")
+                        
+                    except Exception as info_error:
+                        logger.error(f"Info extraction failed: {info_error}")
+                        if attempt < max_attempts:
+                            continue
+                        return jsonify({"error": f"Could not access video: {str(info_error)}"}), 400
                     
-                    # Check if video is available
-                    if info.get('availability') in ['private', 'premium_only', 'subscriber_only']:
-                        return jsonify({"error": f"Video is not available: {info.get('availability')}"}), 400
-                    
-                    # Now download
-                    logger.info(f"Downloading: {info.get('title', 'Unknown')}")
-                    ydl.download([youtube_url])
+                    # Now try to download
+                    logger.info("Starting download...")
+                    try:
+                        ydl.download([youtube_url])
+                    except Exception as download_error:
+                        logger.error(f"Download failed: {download_error}")
+                        # Re-raise to be caught by outer exception handler
+                        raise download_error
                     
                     # Find the downloaded file
-                    downloaded_files = list(Path(temp_dir).glob('*.mp3'))
-                    if not downloaded_files:
-                        # Check for other audio formats
-                        downloaded_files = list(Path(temp_dir).glob('*.m4a'))
-                        if not downloaded_files:
-                            downloaded_files = list(Path(temp_dir).glob('*.webm'))
+                    downloaded_files = []
+                    
+                    # Look for various audio formats
+                    for pattern in ['*.mp3', '*.m4a', '*.webm', '*.ogg']:
+                        found_files = list(Path(temp_dir).glob(pattern))
+                        downloaded_files.extend(found_files)
                     
                     if downloaded_files:
+                        # Sort by modification time and get the newest file
+                        downloaded_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
                         file_path = str(downloaded_files[0])
                         logger.info(f"Download successful: {file_path}")
                         
@@ -156,6 +146,8 @@ def download_audio():
                         original_name = info.get('title', 'audio') + '.mp3'
                         # Clean filename for download
                         safe_filename = "".join(c for c in original_name if c.isalnum() or c in (' ', '-', '_', '.')).rstrip()
+                        if not safe_filename.endswith('.mp3'):
+                            safe_filename += '.mp3'
                         
                         return send_file(
                             file_path, 
@@ -166,16 +158,17 @@ def download_audio():
                     else:
                         logger.error(f"No audio file found after download attempt {attempt}")
                         if attempt < max_attempts:
-                            time.sleep(random.uniform(10, 20))
                             continue
+                        return jsonify({"error": "Download completed but no audio file was created"}), 500
                 
             except yt_dlp.utils.DownloadError as e:
                 error_msg = str(e).lower()
-                logger.error(f"yt-dlp error on attempt {attempt}: {e}")
+                logger.error(f"yt-dlp DownloadError on attempt {attempt}: {e}")
                 
+                # Handle specific known errors
                 if "429" in error_msg or "too many requests" in error_msg:
                     if attempt < max_attempts:
-                        delay = min(180, 30 * (2 ** (attempt - 1)) + random.uniform(0, 30))
+                        delay = min(120, 20 * attempt + random.uniform(0, 20))
                         logger.info(f"Rate limited. Waiting {delay:.1f} seconds...")
                         time.sleep(delay)
                         continue
@@ -193,7 +186,7 @@ def download_audio():
                 
                 else:
                     if attempt < max_attempts:
-                        delay = random.uniform(15, 30)
+                        delay = random.uniform(10, 20)
                         logger.info(f"Download error, retrying in {delay:.1f} seconds...")
                         time.sleep(delay)
                         continue
@@ -201,9 +194,38 @@ def download_audio():
                         return jsonify({"error": f"Download failed: {str(e)}"}), 500
             
             except Exception as e:
-                logger.error(f"Unexpected error on attempt {attempt}: {e}")
+                error_str = str(e)
+                logger.error(f"Unexpected error on attempt {attempt}: {error_str}")
+                
+                # Check if this is the tuple comparison error
+                if "'>' not supported between instances of 'int' and 'tuple'" in error_str:
+                    logger.error("Detected tuple comparison bug in yt-dlp")
+                    if attempt < max_attempts:
+                        # Try with even more minimal options
+                        logger.info("Retrying with minimal yt-dlp configuration...")
+                        ydl_opts = {
+                            'format': 'bestaudio',
+                            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+                            'postprocessors': [{
+                                'key': 'FFmpegExtractAudio',
+                                'preferredcodec': 'mp3',
+                            }],
+                            'noplaylist': True,
+                        }
+                        if os.path.exists(cookie_path):
+                            ydl_opts['cookiefile'] = cookie_path
+                        if proxy_url:
+                            ydl_opts['proxy'] = proxy_url
+                        
+                        time.sleep(random.uniform(5, 10))
+                        continue
+                    else:
+                        return jsonify({"error": "yt-dlp internal error. Please try updating yt-dlp or try a different video."}), 500
+                
                 if attempt < max_attempts:
-                    time.sleep(random.uniform(10, 20))
+                    delay = random.uniform(10, 20)
+                    logger.info(f"Unexpected error, retrying in {delay:.1f} seconds...")
+                    time.sleep(delay)
                     continue
                 else:
                     return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
@@ -233,5 +255,11 @@ if __name__ == '__main__':
         logger.info("FFmpeg is available")
     except (subprocess.CalledProcessError, FileNotFoundError):
         logger.warning("FFmpeg not found. Audio conversion may not work properly.")
+    
+    # Check yt-dlp version
+    try:
+        logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
+    except:
+        logger.info("Could not determine yt-dlp version")
     
     app.run(host='0.0.0.0', port=8080, debug=False)
