@@ -31,6 +31,134 @@ def health_check():
     """Health check endpoint for Render.com"""
     return jsonify({"status": "healthy", "service": "youtube-audio-downloader"}), 200
 
+@app.route('/download/audio/ultrafast', methods=['POST'])
+def download_audio_ultrafast():
+    """Ultra-fast download prioritizing speed over maximum quality (still high quality 256kbps)"""
+    if not request.is_json:
+        return jsonify({"error": "Invalid request format. Must be JSON."}), 400
+    
+    data = request.json
+    youtube_url = data.get('url')
+
+    if not youtube_url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    # Strip the playlist part from the URL if it exists
+    if "&list=" in youtube_url:
+        youtube_url = youtube_url.split("&list=")[0]
+    
+    logger.info(f"Ultra-fast download for URL: {youtube_url}")
+
+    # Create a temporary directory
+    try:
+        if os.path.exists('/tmp') and os.access('/tmp', os.W_OK):
+            temp_dir = tempfile.mkdtemp(dir='/tmp')
+        else:
+            temp_dir = tempfile.mkdtemp(dir='.')
+    except Exception as e:
+        logger.error(f"Could not create temp directory: {e}")
+        return jsonify({"error": "Server storage issue"}), 500
+    
+    try:
+        # Get paths
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cookie_path = os.path.join(script_dir, 'cookies.txt')
+        proxy_url = os.environ.get('HTTP_PROXY')
+
+        # Ultra-speed optimized options (still good quality)
+        ydl_opts = {
+            # Prioritize already-compressed formats to minimize conversion time
+            'format': 'bestaudio[abr<=256][abr>=128]/bestaudio[ext=m4a][abr<=256]/bestaudio[ext=webm][abr<=256]/bestaudio',
+            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '256',  # Still high quality, but faster
+            }],
+            'postprocessor_args': [
+                '-ar', '44100',
+                '-ac', '2',
+                '-b:a', '256k',
+                '-threads', '0',           # Use all cores
+                '-preset', 'superfast',    # Even faster preset
+                '-tune', 'fastdecode',     # Optimize for speed
+            ],
+            'prefer_ffmpeg': True,
+            'keepvideo': False,
+            'noplaylist': True,
+            
+            # Maximum speed settings
+            'concurrent_fragment_downloads': 6,   # More parallel downloads
+            'http_chunk_size': 2097152,          # 2MB chunks
+            'buffer_size': 32768,                # Even larger buffer
+            'no_color': True,
+            'quiet': True,                       # Minimize output processing
+            'no_warnings': True,
+            
+            # Minimal retry for speed
+            'socket_timeout': 15,
+            'fragment_retries': 0,               # No retries for maximum speed
+            'retries': 0,
+            'extractor_retries': 0,
+            
+            # Skip unnecessary operations
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'embed_subs': False,
+            'writeinfojson': False,
+            'writethumbnail': False,
+            'extract_flat': False,
+        }
+
+        # Add cookies and proxy if available
+        if os.path.exists(cookie_path):
+            ydl_opts['cookiefile'] = cookie_path
+        if proxy_url:
+            ydl_opts['proxy'] = proxy_url
+
+        # Single attempt for maximum speed
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                logger.info("Starting ultra-fast download...")
+                ydl.download([youtube_url])
+                
+                # Find the downloaded file quickly
+                for pattern in ['*.mp3', '*.m4a', '*.webm']:
+                    found_files = list(Path(temp_dir).glob(pattern))
+                    if found_files:
+                        file_path = str(found_files[0])
+                        logger.info(f"Ultra-fast download successful: {file_path}")
+                        
+                        safe_filename = f"audio_ultrafast_{int(time.time())}.mp3"
+                        
+                        return send_file(
+                            file_path, 
+                            as_attachment=True, 
+                            download_name=safe_filename,
+                            mimetype='audio/mpeg'
+                        )
+                
+                return jsonify({"error": "Download completed but no audio file was created"}), 500
+        
+        except Exception as e:
+            error_str = str(e).lower()
+            logger.error(f"Ultra-fast download failed: {e}")
+            
+            if "429" in error_str or "too many requests" in error_str:
+                return jsonify({"error": "Rate limited. Try again in a few minutes."}), 429
+            elif any(phrase in error_str for phrase in ["unavailable", "private", "deleted"]):
+                return jsonify({"error": "Video is unavailable or private"}), 400
+            else:
+                return jsonify({"error": f"Download failed: {str(e)}"}), 500
+    
+    finally:
+        # Clean up
+        try:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
+
 @app.route('/download/audio/fast', methods=['POST'])
 def download_audio_fast():
     """Fast download with high quality audio"""
@@ -75,27 +203,39 @@ def download_audio_fast():
         # Get proxy from environment
         proxy_url = os.environ.get('HTTP_PROXY')
 
-        # High-quality but optimized yt-dlp options
+        # Speed-optimized high-quality yt-dlp options
         ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',  # Prefer high-quality formats
+            # Prioritize formats that are already high quality and need minimal conversion
+            'format': 'bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio[ext=m4a]/bestaudio[abr>=160]/bestaudio',
             'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '320',  # Highest MP3 quality
+                'preferredquality': '320',
             }],
             'postprocessor_args': [
-                '-ar', '48000',  # High sample rate
-                '-ac', '2',      # Stereo
-                '-b:a', '320k',  # High bitrate
+                '-ar', '44100',    # Standard high quality (48kHz can be slower)
+                '-ac', '2',        # Stereo
+                '-b:a', '320k',    # High bitrate
+                '-threads', '0',   # Use all CPU cores for encoding
+                '-preset', 'ultrafast',  # Fastest encoding preset
             ],
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
-            'socket_timeout': 25,
-            'fragment_retries': 2,
-            'retries': 2,
+            
+            # Speed optimizations
+            'concurrent_fragment_downloads': 4,  # Download fragments in parallel
+            'http_chunk_size': 1048576,          # 1MB chunks for faster download
+            'buffer_size': 16384,                # Larger buffer
+            'no_color': True,                    # Reduce output processing
             'no_warnings': True,
+            
+            # Network optimizations
+            'socket_timeout': 20,
+            'fragment_retries': 1,               # Reduce retries for speed
+            'retries': 1,
+            'extractor_retries': 1,
         }
 
         # Add cookies and proxy if available
@@ -250,24 +390,46 @@ def background_download(job_id, youtube_url):
         proxy_url = os.environ.get('HTTP_PROXY')
         
         ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio',  # Best quality available
+            # Speed-first format selection prioritizing already high-quality formats
+            'format': 'bestaudio[acodec=opus]/bestaudio[acodec=aac]/bestaudio[ext=m4a]/bestaudio[abr>=160]/bestaudio',
             'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '320',  # Highest MP3 quality
+                'preferredquality': '320',
             }],
             'postprocessor_args': [
-                '-ar', '48000',  # High sample rate
-                '-ac', '2',      # Stereo
-                '-b:a', '320k',  # High bitrate
+                '-ar', '44100',       # Standard high quality (faster than 48kHz)
+                '-ac', '2',           # Stereo
+                '-b:a', '320k',       # High bitrate
+                '-threads', '0',      # Use all available CPU cores
+                '-preset', 'ultrafast',  # Fastest encoding preset
+                '-avoid_negative_ts', 'make_zero',  # Avoid processing delays
             ],
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
-            'socket_timeout': 30,
-            'fragment_retries': 2,
-            'retries': 2,
+            
+            # Advanced speed optimizations
+            'concurrent_fragment_downloads': 4,   # Download fragments in parallel
+            'http_chunk_size': 1048576,          # 1MB chunks
+            'buffer_size': 16384,                # Larger buffer
+            'no_color': True,
+            'quiet': False,                      # Keep some logging for status updates
+            'no_warnings': False,
+            
+            # Network optimizations for Render.com
+            'socket_timeout': 25,
+            'fragment_retries': 1,               # Minimal retries for speed
+            'retries': 1,
+            'extractor_retries': 1,
+            
+            # Additional optimizations
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'embed_subs': False,
+            'writeinfojson': False,
+            'writethumbnail': False,
         }
         
         if os.path.exists(cookie_path):
@@ -495,22 +657,38 @@ if __name__ == '__main__':
     # Get port from environment variable (Render.com requirement)
     port = int(os.environ.get('PORT', 8080))
     
+    # Optimize for maximum performance on Render.com
+    import os
+    # Set FFmpeg thread count to use all available cores
+    os.environ['FFMPEG_THREADS'] = '0'
+    # Optimize memory usage
+    os.environ['MALLOC_ARENA_MAX'] = '2'
+    
     # Check if ffmpeg is available
     import subprocess
     try:
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, text=True)
         logger.info("FFmpeg is available")
+        # Log available encoders for optimization
+        if 'libmp3lame' in result.stdout:
+            logger.info("libmp3lame encoder available - optimal MP3 encoding")
     except (subprocess.CalledProcessError, FileNotFoundError):
         logger.error("FFmpeg not found. This will cause failures on Render.com")
     
     # Check yt-dlp version
     try:
         logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
+        logger.info("Server optimized for maximum speed + high quality downloads")
+        logger.info("Available endpoints:")
+        logger.info("- /download/audio/ultrafast (256kbps, maximum speed)")
+        logger.info("- /download/audio/fast (320kbps, balanced)")
+        logger.info("- /download/audio/async (320kbps, no timeout)")
+        logger.info("- /download/audio/lossless (original format)")
     except:
         logger.info("Could not determine yt-dlp version")
     
     # Production-ready server settings
     if os.environ.get('RENDER'):
-        logger.info("Running on Render.com")
+        logger.info("Running on Render.com with speed optimizations")
     else:
         app.run(host='0.0.0.0', port=port, debug=True)
