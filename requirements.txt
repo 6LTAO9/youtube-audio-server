@@ -4,3 +4,4 @@ psutil==5.9.5
 requests==2.31.0
 pathlib
 gunicorn==21.2.0
+Flask-CORS==4.0.0
