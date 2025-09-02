@@ -597,10 +597,15 @@ def get_download_file(job_id):
     response.headers['X-Job-ID'] = job_id
     return response
 
-# Legacy endpoints
+# Legacy endpoints for backward compatibility
 @app.route('/download/audio', methods=['POST'])
 @rate_limit()
 def download_audio():
+    return download_audio_ultrafast()
+
+@app.route('/download/audio/fast', methods=['POST'])
+@rate_limit()
+def download_audio_fast():
     return download_audio_ultrafast()
 
 # Error handlers
