@@ -270,6 +270,10 @@ def handle_download_error(e):
     else:
         return "DOWNLOAD_ERROR", str(e)
 
+@app.before_request
+def log_request_info():
+    logger.info(f"Request: {request.method} {request.url}")
+
 @app.route('/', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -643,6 +647,7 @@ if __name__ == '__main__':
         logger.warning(f"Proxy init failed: {e}")
     
     logger.info("🎵 YouTube Audio Downloader - Optimized Version")
-    logger.info(f"🚀 Starting server on port {port}")
+    logger.info(f"🚀 Starting server on host 0.0.0.0 port {port}")
     
+    # Ensure we're binding to all interfaces
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
