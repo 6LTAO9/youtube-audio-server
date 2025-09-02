@@ -37,7 +37,7 @@ download_status = {}
 download_files = {}
 download_metadata = {}
 active_downloads = 0
-MAX_CONCURRENT_DOWNLOADS = 2
+MAX_CONCURRENT_DOWNLOADS = 1  # Reduced from 2 to 1 for free tier
 
 # Rate limiting storage (in-memory for free tier)
 rate_limit_storage = {}
@@ -46,6 +46,7 @@ rate_limit_storage = {}
 current_proxy = None
 proxy_last_fetched = 0
 PROXY_UPDATE_INTERVAL = 3600  # 1 hour
+USE_PROXY = os.environ.get('USE_PROXY', 'false').lower() == 'true'
 
 def extract_video_id(url):
     """Extract video ID from various YouTube URL formats"""
@@ -84,64 +85,54 @@ def validate_youtube_url(url):
     return clean_url, None
 
 def get_working_proxy():
-    """Enhanced proxy fetching from multiple sources including TheSpeedX/PROXY-List"""
+    """Enhanced proxy fetching - only when USE_PROXY is enabled"""
     global current_proxy, proxy_last_fetched
+    
+    # Skip proxy functionality if disabled or on Render startup
+    if not USE_PROXY:
+        return None
+        
+    # Skip proxy fetch on Render during startup to prevent deployment timeout
+    if os.environ.get('RENDER') and current_proxy is None and proxy_last_fetched == 0:
+        logger.info("Skipping proxy initialization on Render deployment")
+        return None
     
     current_time = time.time()
     if (current_time - proxy_last_fetched > PROXY_UPDATE_INTERVAL) or (current_proxy is None):
         try:
             # Primary source: TheSpeedX/PROXY-List (GitHub)
-            # Backup sources for better reliability
             proxy_urls = [
                 'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
-                'https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/http.txt',  # Alternative path
                 'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt'  # Backup source
             ]
             
             all_proxies = []
-            successful_sources = []
             
             for url in proxy_urls:
                 try:
                     logger.info(f"Fetching proxies from: {url}")
-                    response = requests.get(url, timeout=15)
+                    response = requests.get(url, timeout=10)  # Reduced timeout
                     if response.status_code == 200:
-                        # Parse different formats
-                        if 'TheSpeedX' in url:
-                            # TheSpeedX format: IP:PORT per line
-                            proxies = [line.strip() for line in response.text.strip().split('\n') 
-                                     if ':' in line.strip() and line.strip().count(':') == 1
-                                     and not line.strip().startswith('#')]
-                        else:
-                            # Other formats may include additional info
-                            proxies = []
-                            for line in response.text.strip().split('\n'):
-                                if ':' in line and not line.startswith('#'):
-                                    # Extract IP:PORT (first two parts if more fields exist)
-                                    parts = line.strip().split(':')
-                                    if len(parts) >= 2:
-                                        proxy = f"{parts[0]}:{parts[1]}"
-                                        if proxy.count(':') == 1:
-                                            proxies.append(proxy)
+                        # TheSpeedX format: IP:PORT per line
+                        proxies = [line.strip() for line in response.text.strip().split('\n') 
+                                 if ':' in line.strip() and line.strip().count(':') == 1
+                                 and not line.strip().startswith('#')]
                         
                         all_proxies.extend(proxies)
-                        successful_sources.append(url)
-                        logger.info(f"✅ Fetched {len(proxies)} proxies from {url}")
+                        logger.info(f"Fetched {len(proxies)} proxies from {url}")
+                        break  # Use first successful source only for faster startup
                 except Exception as e:
-                    logger.warning(f"❌ Failed to fetch from {url}: {e}")
+                    logger.warning(f"Failed to fetch from {url}: {e}")
                     continue
             
             if all_proxies:
-                logger.info(f"🌐 Total proxies collected: {len(all_proxies)} from {len(successful_sources)} sources")
-                
-                # Remove duplicates and invalid entries
+                # Remove duplicates and validate
                 unique_proxies = list(set(all_proxies))
                 valid_proxies = []
                 
-                for proxy in unique_proxies:
+                for proxy in unique_proxies[:50]:  # Limit to first 50 for faster processing
                     try:
                         ip, port = proxy.split(':')
-                        # Basic validation
                         if (len(ip.split('.')) == 4 and 
                             all(0 <= int(octet) <= 255 for octet in ip.split('.')) and
                             1 <= int(port) <= 65535):
@@ -149,67 +140,41 @@ def get_working_proxy():
                     except (ValueError, IndexError):
                         continue
                 
-                logger.info(f"📊 Valid proxies after filtering: {len(valid_proxies)}")
-                
                 if valid_proxies:
-                    # Test more proxies for better success rate
-                    test_count = min(8, len(valid_proxies))  # Test up to 8 proxies
+                    # Test fewer proxies for faster response
+                    test_count = min(3, len(valid_proxies))  # Reduced from 8 to 3
                     test_proxies = random.sample(valid_proxies, test_count)
                     
-                    logger.info(f"🧪 Testing {len(test_proxies)} random proxies...")
-                    
-                    for i, proxy in enumerate(test_proxies):
+                    for proxy in test_proxies:
                         test_proxy = f"http://{proxy}"
-                        logger.info(f"Testing proxy {i+1}/{len(test_proxies)}: {proxy}")
-                        
-                        if test_proxy_quick(test_proxy):
+                        if test_proxy_quick(test_proxy, timeout=5):  # Reduced timeout
                             current_proxy = test_proxy
                             proxy_last_fetched = current_time
-                            logger.info(f"✅ Found working proxy: {current_proxy}")
+                            logger.info(f"Found working proxy: {current_proxy}")
                             return current_proxy
                     
-                    logger.warning("⚠️ No working proxies found after testing, using direct connection")
-                else:
-                    logger.warning("⚠️ No valid proxies found after filtering")
+                    logger.warning("No working proxies found, using direct connection")
                 
                 current_proxy = None
             else:
-                logger.warning("⚠️ No proxies fetched from any source")
                 current_proxy = None
                 
         except Exception as e:
-            logger.error(f"❌ Error in proxy fetching system: {e}")
+            logger.error(f"Error in proxy fetching: {e}")
             current_proxy = None
     
     return current_proxy
 
-def test_proxy_quick(proxy_url, timeout=8):
-    """Enhanced proxy testing with multiple validation endpoints"""
+def test_proxy_quick(proxy_url, timeout=5):
+    """Quick proxy testing with single endpoint"""
     try:
         proxies = {'http': proxy_url, 'https': proxy_url}
-        
-        # Test endpoints (in order of preference)
-        test_endpoints = [
-            'http://httpbin.org/ip',           # Primary
-            'http://ip-api.com/json',          # Backup
-            'http://ifconfig.me/ip',           # Alternative
-        ]
-        
-        for endpoint in test_endpoints:
-            try:
-                response = requests.get(endpoint, proxies=proxies, timeout=timeout)
-                if response.status_code == 200:
-                    # Additional validation: check if we got a valid response
-                    if 'origin' in response.text or 'query' in response.text or len(response.text.strip()) > 5:
-                        return True
-            except:
-                continue
-        
-        return False
+        response = requests.get('http://httpbin.org/ip', proxies=proxies, timeout=timeout)
+        return response.status_code == 200 and 'origin' in response.text
     except Exception:
         return False
 
-def rate_limit(max_requests=8, window=300):  # iOS-friendly rate limiting
+def rate_limit(max_requests=8, window=300):
     """Simple in-memory rate limiting with iOS considerations"""
     def decorator(f):
         @wraps(f)
@@ -297,6 +262,28 @@ def cleanup_old_downloads(force=False, max_age=1800):
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
 
+def aggressive_cleanup():
+    """More aggressive cleanup for free tier startup"""
+    try:
+        import shutil
+        temp_dirs = ['/tmp', '/var/tmp']
+        
+        for temp_dir in temp_dirs:
+            if os.path.exists(temp_dir):
+                for item in os.listdir(temp_dir):
+                    if item.startswith('yt_') or item.startswith('tmp'):
+                        item_path = os.path.join(temp_dir, item)
+                        try:
+                            if os.path.isdir(item_path):
+                                shutil.rmtree(item_path, ignore_errors=True)
+                            else:
+                                os.remove(item_path)
+                        except:
+                            pass
+        logger.info("Aggressive cleanup completed")
+    except Exception as e:
+        logger.warning(f"Aggressive cleanup failed: {e}")
+
 @app.route('/', methods=['GET'])
 def health_check():
     """iOS-friendly health check with detailed status"""
@@ -309,7 +296,7 @@ def health_check():
             "success": True,
             "data": {
                 "service": "youtube-audio-downloader",
-                "version": "2.0-ios",
+                "version": "2.0-ios-render",
                 "status": "healthy",
                 "server_info": {
                     "active_downloads": active_downloads,
@@ -317,7 +304,8 @@ def health_check():
                     "memory_usage_percent": round(memory_percent, 1),
                     "free_disk_gb": round(free_gb, 2),
                     "proxy_status": "active" if current_proxy else "direct",
-                    "max_concurrent": MAX_CONCURRENT_DOWNLOADS
+                    "max_concurrent": MAX_CONCURRENT_DOWNLOADS,
+                    "proxy_enabled": USE_PROXY
                 },
                 "endpoints": {
                     "quick_download": "/api/v1/download/quick",
@@ -340,12 +328,13 @@ def health_check():
             "success": True,
             "data": {
                 "service": "youtube-audio-downloader",
-                "status": "healthy"
+                "status": "healthy",
+                "version": "2.0-ios-render"
             }
         }), 200
 
 @app.route('/api/v1/video/info', methods=['POST'])
-@rate_limit(max_requests=15, window=300)  # Higher limit for info requests
+@rate_limit(max_requests=15, window=300)
 def get_video_info():
     """Get video information without downloading - iOS optimized"""
     try:
@@ -386,11 +375,14 @@ def get_video_info():
             'no_warnings': True,
             'extract_flat': False,
             'skip_download': True,
+            'socket_timeout': 15,
         }
         
-        proxy_url = get_working_proxy()
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+        # Only add proxy if enabled and available
+        if USE_PROXY:
+            proxy_url = get_working_proxy()
+            if proxy_url:
+                ydl_opts['proxy'] = proxy_url
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(clean_url, download=False)
@@ -456,7 +448,7 @@ def get_video_info():
 @app.route('/api/v1/download/quick', methods=['POST'])
 @rate_limit(max_requests=5, window=300)
 def download_audio_quick():
-    """Ultra-fast download optimized for iOS with better error handling"""
+    """Ultra-fast download optimized for iOS and Render free tier"""
     global active_downloads
     
     can_proceed, error_code, error_message = check_system_resources()
@@ -508,7 +500,7 @@ def download_audio_quick():
         cleanup_old_downloads(force=True)
         temp_dir = tempfile.mkdtemp(dir='/tmp', prefix='yt_quick_')
         
-        # Quality-based settings
+        # Quality-based settings optimized for free tier
         quality_settings = {
             'ultra_fast': {
                 'format': 'worstaudio[abr>=64]/bestaudio[abr<=96]',
@@ -544,15 +536,15 @@ def download_audio_quick():
                 '-ar', settings['sample_rate'],
                 '-ac', settings['channels'],
                 '-b:a', f"{settings['quality']}k",
-                '-threads', '2',
+                '-threads', '1',  # Reduced for free tier
                 '-preset', 'ultrafast' if quality == 'ultra_fast' else 'fast',
             ],
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
-            'concurrent_fragment_downloads': 2,
-            'http_chunk_size': 512000,
-            'buffer_size': 8192,
+            'concurrent_fragment_downloads': 1,  # Reduced for free tier
+            'http_chunk_size': 256000,  # Reduced for free tier
+            'buffer_size': 4096,  # Reduced for free tier
             'no_color': True,
             'quiet': True,
             'no_warnings': True,
@@ -569,10 +561,11 @@ def download_audio_quick():
             'no_check_certificate': True,
         }
 
-        # Add proxy if available
-        proxy_url = get_working_proxy()
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+        # Add proxy only if enabled
+        if USE_PROXY:
+            proxy_url = get_working_proxy()
+            if proxy_url:
+                ydl_opts['proxy'] = proxy_url
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -633,47 +626,6 @@ def download_audio_quick():
         
         except Exception as e:
             error_str = str(e).lower()
-            
-            if "proxy" in error_str or "tunnel connection failed" in error_str:
-                # Retry without proxy
-                if 'proxy' in ydl_opts:
-                    del ydl_opts['proxy']
-                    try:
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.download([clean_url])
-                            
-                            for pattern in ['*.mp3', '*.m4a', '*.webm']:
-                                found_files = list(Path(temp_dir).glob(pattern))
-                                if found_files:
-                                    file_path = str(found_files[0])
-                                    safe_filename = f"audio_{quality}_{int(time.time())}.mp3"
-                                    
-                                    def cleanup_after_send():
-                                        time.sleep(60)
-                                        try:
-                                            import shutil
-                                            shutil.rmtree(temp_dir, ignore_errors=True)
-                                        except Exception:
-                                            pass
-                                    
-                                    cleanup_thread = threading.Thread(target=cleanup_after_send)
-                                    cleanup_thread.daemon = True
-                                    cleanup_thread.start()
-                                    
-                                    return send_file(
-                                        file_path,
-                                        as_attachment=True,
-                                        download_name=safe_filename,
-                                        mimetype='audio/mpeg'
-                                    )
-                    except Exception as retry_error:
-                        return jsonify({
-                            "success": False,
-                            "error": {
-                                "code": "DOWNLOAD_FAILED",
-                                "message": f"Download failed: {str(retry_error)}"
-                            }
-                        }), 500
             
             # Handle specific errors
             if "429" in error_str or "too many requests" in error_str:
@@ -816,7 +768,7 @@ def background_download_ios(job_id, youtube_url, quality):
             'message': 'Extracting video information...'
         })
         
-        # Quality settings
+        # Quality settings optimized for free tier
         quality_settings = {
             'standard': {'format': 'bestaudio[abr<=128]', 'quality': '128'},
             'high': {'format': 'bestaudio[abr<=192]', 'quality': '192'},
@@ -837,15 +789,15 @@ def background_download_ios(job_id, youtube_url, quality):
                 '-ar', '44100',
                 '-ac', '2',
                 '-b:a', f"{settings['quality']}k",
-                '-threads', '2',
-                '-preset', 'medium',
+                '-threads', '1',  # Reduced for free tier
+                '-preset', 'fast',  # Changed from medium to fast
             ],
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
-            'concurrent_fragment_downloads': 3,
-            'http_chunk_size': 1048576,
-            'buffer_size': 16384,
+            'concurrent_fragment_downloads': 1,  # Reduced for free tier
+            'http_chunk_size': 512000,  # Reduced for free tier
+            'buffer_size': 8192,  # Reduced for free tier
             'no_color': True,
             'quiet': False,
             'socket_timeout': 30,
@@ -859,9 +811,11 @@ def background_download_ios(job_id, youtube_url, quality):
             'writethumbnail': False,
         }
         
-        proxy_url = get_working_proxy()
-        if proxy_url:
-            ydl_opts['proxy'] = proxy_url
+        # Add proxy only if enabled
+        if USE_PROXY:
+            proxy_url = get_working_proxy()
+            if proxy_url:
+                ydl_opts['proxy'] = proxy_url
         
         download_status[job_id].update({
             'progress': 40,
@@ -1165,6 +1119,7 @@ def server_stats():
                 "memory_usage_percent": round(memory_percent, 1),
                 "free_disk_gb": round(free_gb, 2),
                 "proxy_active": current_proxy is not None,
+                "proxy_enabled": USE_PROXY,
                 "server_uptime": int(time.time() - psutil.boot_time()) if hasattr(psutil, 'boot_time') else 0
             }
         }), 200
@@ -1273,40 +1228,59 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
     
     # Free tier optimizations
-    os.environ['FFMPEG_THREADS'] = '2'
+    os.environ['FFMPEG_THREADS'] = '1'  # Reduced from 2 to 1
     os.environ['MALLOC_ARENA_MAX'] = '1'
+    os.environ['PYTHONHASHSEED'] = '0'
+    os.environ['OMP_NUM_THREADS'] = '1'
+    
+    # Aggressive startup cleanup for free tier
+    logger.info("Performing startup cleanup...")
+    aggressive_cleanup()
     
     # Start background cleanup thread
     cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
     cleanup_thread.start()
     
-    # Initialize proxy on startup
-    logger.info("Fetching initial proxy list...")
-    try:
-        get_working_proxy()
-    except Exception as e:
-        logger.warning(f"Initial proxy fetch failed: {e}")
+    # CRITICAL: Skip proxy initialization on Render to prevent deployment timeout
+    if os.environ.get('RENDER'):
+        logger.info("Render deployment detected - skipping proxy initialization for faster startup")
+        current_proxy = None
+    else:
+        # Only fetch proxy for local development
+        logger.info("Local development detected - fetching initial proxy list...")
+        try:
+            if USE_PROXY:
+                get_working_proxy()
+        except Exception as e:
+            logger.warning(f"Initial proxy fetch failed: {e}")
     
-    # System checks
+    # System checks (make these non-blocking and fast)
     try:
         import subprocess
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, text=True)
-        logger.info("✅ FFmpeg is available")
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5, text=True)
+        if result.returncode == 0:
+            logger.info("FFmpeg is available")
+        else:
+            logger.warning("FFmpeg check returned non-zero exit code")
+    except subprocess.TimeoutExpired:
+        logger.warning("FFmpeg check timed out")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.error("❌ FFmpeg not found - downloads may fail")
+        logger.error("FFmpeg not found - downloads may fail")
+    except Exception as e:
+        logger.warning(f"FFmpeg check failed: {e}")
     
     try:
-        logger.info(f"✅ yt-dlp version: {yt_dlp.version.__version__}")
-    except:
-        logger.warning("⚠️ Could not determine yt-dlp version")
+        logger.info(f"yt-dlp version: {yt_dlp.version.__version__}")
+    except Exception as e:
+        logger.warning(f"Could not determine yt-dlp version: {e}")
     
     logger.info("=" * 60)
-    logger.info("🎵 YOUTUBE AUDIO DOWNLOADER SERVER v2.0-iOS")
-    logger.info("🏠 Optimized for Render.com FREE TIER")
-    logger.info("📱 Enhanced for iOS App Integration")
+    logger.info("YouTube Audio Downloader Server v2.0-iOS-Render")
+    logger.info("Optimized for Render.com FREE TIER")
+    logger.info("Enhanced for iOS App Integration")
     logger.info("=" * 60)
     
-    logger.info("📡 API Endpoints:")
+    logger.info("API Endpoints:")
     logger.info("  • GET  /                           - Health check")
     logger.info("  • POST /api/v1/video/info          - Get video info (no download)")
     logger.info("  • POST /api/v1/download/quick      - Quick download (ultra-fast)")
@@ -1316,27 +1290,33 @@ if __name__ == '__main__':
     logger.info("  • DEL  /api/v1/download/cancel/{id} - Cancel download")
     logger.info("  • GET  /api/v1/server/stats         - Server statistics")
     
-    logger.info("🔧 Features:")
-    logger.info("  • ✅ iOS-optimized JSON responses")
-    logger.info("  • ✅ CORS enabled for iOS apps")
-    logger.info("  • ✅ Enhanced error handling with error codes")
-    logger.info("  • ✅ Video metadata extraction")
-    logger.info("  • ✅ Multiple quality options")
-    logger.info("  • ✅ Progress tracking for background downloads")
-    logger.info("  • ✅ Auto-proxy rotation")
-    logger.info("  • ✅ Smart rate limiting")
-    logger.info("  • ✅ Automatic cleanup")
-    logger.info("  • ✅ Memory and disk monitoring")
+    logger.info("Features:")
+    logger.info("  • iOS-optimized JSON responses")
+    logger.info("  • CORS enabled for iOS apps")
+    logger.info("  • Enhanced error handling with error codes")
+    logger.info("  • Video metadata extraction")
+    logger.info("  • Multiple quality options")
+    logger.info("  • Progress tracking for background downloads")
+    logger.info("  • Smart rate limiting")
+    logger.info("  • Automatic cleanup")
+    logger.info("  • Memory and disk monitoring")
+    logger.info(f"  • Proxy support: {'ENABLED' if USE_PROXY else 'DISABLED'}")
     
-    if current_proxy:
-        logger.info(f"🌐 Proxy active: {current_proxy}")
+    if USE_PROXY and current_proxy:
+        logger.info(f"Proxy active: {current_proxy}")
+    elif USE_PROXY:
+        logger.info("Proxy enabled but none active (will fetch on first use)")
     else:
-        logger.info("🌐 Direct connection (no proxy)")
+        logger.info("Direct connection (proxy disabled)")
     
     if os.environ.get('RENDER'):
-        logger.info("🚀 Running on Render.com with optimizations enabled")
+        logger.info("Running on Render.com with free tier optimizations")
     
     logger.info("=" * 60)
-    logger.info("🟢 Server starting...")
+    logger.info("Server starting...")
     
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    try:
+        app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        raise
