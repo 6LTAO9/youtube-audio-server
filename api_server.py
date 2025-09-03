@@ -58,7 +58,87 @@ if "requested format is not available" in error_str:
                                     except Exception as e:
                                         logger.error(f"Cleanup error: {e}")
                                 
-                                cleanup_threaimport os
+                                cleanup_thread = threading.Thread(target=cleanup_after_send)
+                                cleanup_thread.daemon = True
+                                cleanup_thread.start()
+                                
+                                logger.info("Ultrafast fallback download successful")
+                                return send_file(
+                                    found_file, 
+                                    as_attachment=True, 
+                                    download_name=safe_filename,
+                                    mimetype='audio/mpeg'
+                                )
+                        
+                        return jsonify({
+                            "error": "Fallback download completed but no audio file was created",
+                            "code": "NO_OUTPUT_FILE"
+                        }), 500
+                        
+                except Exception as fallback_error:
+                    fallback_error_str = str(fallback_error).lower()
+                    if "429" in fallback_error_str or "too many requests" in fallback_error_str:
+                        return jsonify({
+                            "error": "YouTube rate limit exceeded. Server heavily throttled. Please wait 15+ minutes.",
+                            "code": "YOUTUBE_RATE_LIMIT_SEVERE",
+                            "retry_after": 1200
+                        }), 429
+                    elif "precondition check failed" in fallback_error_str:
+                        return jsonify({
+                            "error": "YouTube anti-bot protection active. Please try again much later.",
+                            "code": "YOUTUBE_BLOCKED_SEVERE",
+                            "retry_after": 2400
+                        }), 403
+                    else:
+                        logger.error(f"Ultrafast fallback also failed: {fallback_error}")
+                        return jsonify({
+                            "error": "Video format not supported - tried multiple formats",
+                            "code": "FORMAT_NOT_SUPPORTED"
+                        }), 400
+            
+            # Handle other errors similar to main function with enhanced messaging
+            elif "429" in error_str or "too many requests" in error_str:
+                return jsonify({
+                    "error": "YouTube rate limit exceeded. Server is being heavily throttled. Please wait 15+ minutes.",
+                    "code": "YOUTUBE_RATE_LIMIT",
+                    "retry_after": 900,
+                    "suggestion": "Try again much later or use a different video"
+                }), 429
+            elif "precondition check failed" in error_str:
+                return jsonify({
+                    "error": "YouTube anti-bot protection triggered. Please wait before trying again.",
+                    "code": "YOUTUBE_ANTI_BOT", 
+                    "retry_after": 1800,
+                    "suggestion": "Server detected as automated - wait longer between requests"
+                }), 403
+            elif any(phrase in error_str for phrase in ["unavailable", "private", "deleted", "removed"]):
+                return jsonify({
+                    "error": "Video is unavailable, private, or has been removed",
+                    "code": "VIDEO_UNAVAILABLE"
+                }), 400
+            elif "only images are available" in error_str:
+                return jsonify({
+                    "error": "This content only contains images, no audio available",
+                    "code": "NO_AUDIO_CONTENT"
+                }), 400
+            else:
+                logger.error(f"Ultrafast download failed: {e}")
+                return jsonify({
+                    "error": "Download failed due to server error",
+                    "code": "DOWNLOAD_FAILED",
+                    "details": str(e)[:200]
+                }), 500
+    
+    finally:
+        active_downloads -= 1
+        if temp_dir:
+            try:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                logger.error(f"Final cleanup error: {e}")
+
+import os
 import tempfile
 import time
 import threading
