@@ -7,3 +7,5 @@ services:
       pip install -r requirements.txt
     startCommand: python api_server.py
     plan: free
+buildCommand: |
+  pip install --upgrade pip
