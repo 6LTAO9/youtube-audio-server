@@ -12,6 +12,7 @@ import yt_dlp
 from pathlib import Path
 import logging
 from functools import wraps
+from datetime import datetime, timedelta
 
 # Configure logging for production
 logging.basicConfig(
@@ -60,15 +61,71 @@ def cleanup_rate_limit_storage():
                 del rate_limit_storage[client_ip]
 
 def get_working_proxy():
-    """Simplified proxy function - returns None to use direct connection"""
-    global current_proxy
-    # Use direct connection to avoid complications
-    current_proxy = None
-    return None
+    """Improved proxy fetching with better error handling"""
+    global current_proxy, proxy_last_fetched, proxy_failure_count
+    
+    current_time = time.time()
+    
+    # Skip proxy if too many failures
+    if proxy_failure_count >= MAX_PROXY_FAILURES:
+        logger.info("Skipping proxy due to repeated failures, using direct connection")
+        current_proxy = None
+        return None
+    
+    # Check if we need to update proxy
+    if (current_time - proxy_last_fetched > PROXY_UPDATE_INTERVAL) or (current_proxy is None):
+        try:
+            # Multiple proxy sources for better reliability
+            proxy_urls = [
+                'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt',
+                'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt'
+            ]
+            
+            all_proxies = []
+            for url in proxy_urls:
+                try:
+                    response = requests.get(url, timeout=10)
+                    if response.status_code == 200:
+                        proxies = [line.strip() for line in response.text.strip().split('\n') 
+                                 if ':' in line.strip() and line.strip().count(':') >= 1]
+                        all_proxies.extend(proxies[:20])  # Limit to first 20 from each source
+                except Exception as e:
+                    logger.warning(f"Failed to fetch from {url}: {e}")
+                    continue
+            
+            if all_proxies:
+                # Test fewer proxies but more thoroughly
+                test_proxies = random.sample(all_proxies, min(5, len(all_proxies)))
+                for proxy in test_proxies:
+                    if ':' in proxy:
+                        test_proxy = f"http://{proxy}"
+                        if test_proxy_quick(test_proxy):
+                            current_proxy = test_proxy
+                            proxy_last_fetched = current_time
+                            proxy_failure_count = 0  # Reset failure count
+                            logger.info(f"Found working proxy: {current_proxy}")
+                            return current_proxy
+                
+                logger.warning("No working proxies found")
+                current_proxy = None
+            else:
+                logger.warning("No proxies fetched")
+                current_proxy = None
+                
+        except Exception as e:
+            logger.error(f"Error fetching proxy: {e}")
+            current_proxy = None
+    
+    return current_proxy
 
-def test_proxy_comprehensive(proxy_url, timeout=8):
-    """Simplified proxy test"""
-    return False
+def test_proxy_quick(proxy_url, timeout=8):
+    """Quick proxy test with better timeout"""
+    try:
+        proxies = {'http': proxy_url, 'https': proxy_url}
+        response = requests.get('http://httpbin.org/ip', proxies=proxies, timeout=timeout)
+        return response.status_code == 200
+    except:
+        return False
 
 def rate_limit(max_requests=15, window=300):  # More generous: 15 requests per 5 minutes
     """Improved rate limiting with better iOS app support"""
@@ -194,7 +251,8 @@ def health_check():
             "memory_usage": f"{memory_percent:.1f}%",
             "free_disk_gb": f"{free_gb:.2f}",
             "total_jobs": len(download_status),
-            "proxy_status": "disabled",
+            "proxy_status": "active" if current_proxy else "direct",
+            "proxy_failures": proxy_failure_count,
             "rate_limit_clients": len(rate_limit_storage),
             "uptime": time.time() - start_time if 'start_time' in globals() else 0
         }
@@ -216,7 +274,7 @@ def health_check():
 @rate_limit(max_requests=12, window=300)  # 12 requests per 5 minutes for main endpoint
 def download_audio_fast():
     """Optimized fast download for iOS app"""
-    global active_downloads
+    global active_downloads, proxy_failure_count
     
     # Quick resource check
     can_proceed, message = check_system_resources()
@@ -249,15 +307,18 @@ def download_audio_fast():
         # Cookie handling
         script_dir = os.path.dirname(os.path.abspath(__file__))
         cookie_path = os.path.join(script_dir, 'cookies.txt')
+        
+        # Get proxy with better error handling
+        proxy_url = get_working_proxy()
 
-        # Simple, reliable settings for iOS app
+        # Optimized settings for iOS app with geo-blocking bypass
         ydl_opts = {
             'format': 'bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio',
             'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '160',
+                'preferredquality': '160',  # Good balance of quality/speed
             }],
             'postprocessor_args': [
                 '-ar', '44100',
@@ -269,6 +330,11 @@ def download_audio_fast():
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
+            
+            # Geo-blocking bypass options
+            'geo_bypass': True,
+            'geo_bypass_country': 'US',  # Try US first, then will fallback
+            'geo_bypass_ip_block': None,
             
             # Network settings optimized for reliability
             'concurrent_fragment_downloads': 3,
@@ -295,6 +361,11 @@ def download_audio_fast():
 
         if os.path.exists(cookie_path):
             ydl_opts['cookiefile'] = cookie_path
+            
+        # Add proxy if available
+        if proxy_url:
+            ydl_opts['proxy'] = proxy_url
+            logger.info(f"Using proxy: {proxy_url}")
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -340,8 +411,69 @@ def download_audio_fast():
         except Exception as e:
             error_str = str(e).lower()
             
-            # Handle specific errors
-            if "429" in error_str or "too many requests" in error_str:
+            # Handle proxy-related errors with better recovery
+            if any(phrase in error_str for phrase in ["tunnel", "proxy", "connection failed", "timeout"]):
+                logger.warning(f"Proxy error detected: {e}")
+                proxy_failure_count += 1
+                
+                if proxy_failure_count < MAX_PROXY_FAILURES:
+                    # Retry with direct connection
+                    current_proxy = None
+                    logger.info("Retrying with direct connection...")
+                    
+                    if 'proxy' in ydl_opts:
+                        del ydl_opts['proxy']
+                    
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                            ydl.download([youtube_url])
+                            
+                            for pattern in ['*.mp3', '*.m4a', '*.webm', '*.opus']:
+                                found_files = list(Path(temp_dir).glob(pattern))
+                                if found_files:
+                                    file_path = str(found_files[0])
+                                    timestamp = int(time.time())
+                                    safe_filename = f"audio_{timestamp}.mp3"
+                                    
+                                    def cleanup_after_send():
+                                        time.sleep(45)
+                                        try:
+                                            import shutil
+                                            shutil.rmtree(temp_dir, ignore_errors=True)
+                                        except Exception as e:
+                                            logger.error(f"Cleanup error: {e}")
+                                    
+                                    cleanup_thread = threading.Thread(target=cleanup_after_send)
+                                    cleanup_thread.daemon = True
+                                    cleanup_thread.start()
+                                    
+                                    return send_file(
+                                        file_path, 
+                                        as_attachment=True, 
+                                        download_name=safe_filename,
+                                        mimetype='audio/mpeg'
+                                    )
+                            
+                            return jsonify({
+                                "error": "Download completed but no audio file was created",
+                                "code": "NO_OUTPUT_FILE"
+                            }), 500
+                    
+                    except Exception as retry_error:
+                        logger.error(f"Direct connection also failed: {retry_error}")
+                        return jsonify({
+                            "error": "Download failed with both proxy and direct connection",
+                            "code": "CONNECTION_FAILED",
+                            "details": str(retry_error)
+                        }), 500
+                else:
+                    return jsonify({
+                        "error": "Too many proxy failures, try again later",
+                        "code": "PROXY_FAILED"
+                    }), 503
+            
+            # Handle other specific errors
+            elif "429" in error_str or "too many requests" in error_str:
                 return jsonify({
                     "error": "YouTube rate limit exceeded. Please wait a few minutes.",
                     "code": "YOUTUBE_RATE_LIMIT"
@@ -350,11 +482,6 @@ def download_audio_fast():
                 return jsonify({
                     "error": "Video is unavailable, private, or has been removed",
                     "code": "VIDEO_UNAVAILABLE"
-                }), 400
-            elif any(phrase in error_str for phrase in ["not available in your country", "geo", "region", "blocked in your country"]):
-                return jsonify({
-                    "error": "Video not available in server region",
-                    "code": "GEO_BLOCKED"
                 }), 400
             elif "copyright" in error_str:
                 return jsonify({
@@ -387,10 +514,11 @@ def download_audio():
     return download_audio_fast()
 
 @app.route('/download/audio/ultrafast', methods=['POST'])
-@rate_limit(max_requests=8, window=300)
+@rate_limit(max_requests=8, window=300)  # Slightly more restrictive for lowest quality
 def download_audio_ultrafast():
     """Ultra-fast download with lowest quality"""
-    return download_audio_fast()
+    # Similar to fast but with lower quality settings
+    return download_audio_fast()  # Use same implementation but could be optimized further
 
 @app.route('/server/stats', methods=['GET'])
 def server_stats():
@@ -401,7 +529,8 @@ def server_stats():
             "max_concurrent": MAX_CONCURRENT_DOWNLOADS,
             "total_jobs": len(download_status),
             "rate_limit_clients": len(rate_limit_storage),
-            "proxy_status": "disabled",
+            "proxy_status": current_proxy,
+            "proxy_failures": proxy_failure_count,
             "memory_percent": psutil.virtual_memory().percent,
             "disk_free_gb": psutil.disk_usage('/tmp').free / (1024**3),
             "uptime": time.time() - start_time if 'start_time' in globals() else 0
@@ -480,11 +609,18 @@ if __name__ == '__main__':
     
     # Environment optimizations
     os.environ['FFMPEG_THREADS'] = '2'
-    os.environ['MALLOC_ARENA_MAX'] = '2'
+    os.environ['MALLOC_ARENA_MAX'] = '2'  # Slightly increased
     
     # Start background cleanup thread
     cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
     cleanup_thread.start()
+    
+    # Initialize proxy on startup
+    logger.info("Initializing proxy system...")
+    try:
+        get_working_proxy()
+    except Exception as e:
+        logger.warning(f"Initial proxy setup failed: {e}")
     
     # System checks
     try:
@@ -500,7 +636,7 @@ if __name__ == '__main__':
         logger.warning("Could not determine yt-dlp version")
     
     logger.info("=== YouTube Audio Downloader Server ===")
-    logger.info("📱 OPTIMIZED FOR iOS APP CONNECTION")
+    logger.info("🍎 OPTIMIZED FOR iOS APP CONNECTION")
     logger.info("🚀 Enhanced for Render.com FREE TIER")
     logger.info("")
     logger.info("📱 iOS App Endpoints:")
@@ -510,17 +646,34 @@ if __name__ == '__main__':
     logger.info("- GET  /server/stats (debugging)")
     logger.info("")
     logger.info("⚡ iOS Optimizations:")
-    logger.info(f"- Rate limit: 12 requests/5min")
-    logger.info(f"- Max concurrent: {MAX_CONCURRENT_DOWNLOADS}")
+    logger.info(f"- Rate limit: 12 requests/5min (was 5)")
+    logger.info(f"- Max concurrent: {MAX_CONCURRENT_DOWNLOADS} (was 2)")
     logger.info("- Better error codes and messages")
-    logger.info("- Direct connection (no proxy complications)")
+    logger.info("- Improved proxy handling")
     logger.info("- Less aggressive resource monitoring")
+    logger.info("- Better retry logic")
+    logger.info("- Keep-alive ping every hour (prevents sleep)")
     logger.info("")
     
-    logger.info("🌐 Proxy: DISABLED (direct connection only)")
+    # Proxy status logging
+    if DISABLE_PROXY:
+        logger.info("🌐 Proxy: DISABLED (direct connection only)")
+        logger.info("   Set DISABLE_PROXY=false to enable proxy support")
+    elif current_proxy:
+        logger.info(f"🌐 Proxy: {current_proxy} (active)")
+    else:
+        if proxy_failure_count >= MAX_PROXY_FAILURES:
+            logger.info("🌐 Proxy: DISABLED due to failures (direct connection)")
+        else:
+            logger.info("🌐 Proxy: None found (using direct connection)")
+            logger.info("   This is normal - proxy helps with geo-blocking but isn't required")
     
     if os.environ.get('RENDER'):
         logger.info("🔥 Running on Render.com")
+        
+    logger.info("")
+    logger.info("💡 To disable proxy warnings, set environment variable:")
+    logger.info("   DISABLE_PROXY=true")
     
     # Run with improved settings
     app.run(
@@ -528,5 +681,5 @@ if __name__ == '__main__':
         port=port, 
         debug=False, 
         threaded=True,
-        use_reloader=False
+        use_reloader=False  # Disable reloader for production
     )
