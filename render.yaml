@@ -4,10 +4,6 @@ services:
     runtime: python3
     buildCommand: |
       apt-get update && apt-get install -y ffmpeg
-       pip install -U yt-dlp
-       yt-dlp -F FKm1mW7XQcY
-       yt-dlp -x FKm1mW7XQcY
-       yt-dlp -x --audio-format mp3 FKm1mW7XQcY
        pip install -r requirements.txt
     startCommand: python api_server.py
     plan: free
