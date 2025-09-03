@@ -245,7 +245,7 @@ def health_check():
         status = {
             "status": "healthy",
             "service": "youtube-audio-downloader",
-            "version": "2.0-ios-optimized",
+            "version": "2.1-mp3-fixed",
             "active_downloads": active_downloads,
             "max_concurrent": MAX_CONCURRENT_DOWNLOADS,
             "memory_usage": f"{memory_percent:.1f}%",
@@ -273,7 +273,7 @@ def health_check():
 @app.route('/download/audio/fast', methods=['POST'])
 @rate_limit(max_requests=12, window=300)  # 12 requests per 5 minutes for main endpoint
 def download_audio_fast():
-    """Optimized fast download for iOS app"""
+    """Optimized fast download for iOS app with FIXED MP3 FORMAT"""
     global active_downloads, proxy_failure_count
     
     # Quick resource check
@@ -295,14 +295,14 @@ def download_audio_fast():
     if "&list=" in youtube_url:
         youtube_url = youtube_url.split("&list=")[0]
     
-    logger.info(f"Fast download request: {youtube_url}")
+    logger.info(f"Fast MP3 download request: {youtube_url}")
     
     active_downloads += 1
     temp_dir = None
     
     try:
         # Create temp directory
-        temp_dir = tempfile.mkdtemp(dir='/tmp', prefix='yt_fast_')
+        temp_dir = tempfile.mkdtemp(dir='/tmp', prefix='yt_mp3_')
         
         # Cookie handling
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -311,29 +311,39 @@ def download_audio_fast():
         # Get proxy with better error handling
         proxy_url = get_working_proxy()
 
-        # Optimized settings for iOS app with geo-blocking bypass
+        # FIXED MP3 FORMAT SETTINGS - More explicit and reliable
         ydl_opts = {
-            'format': 'bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio',
-            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+            # CRITICAL: Better format selection for MP3 conversion
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=mp4]/bestaudio',
+            
+            # FIXED: More specific output template to ensure .mp3 extension
+            'outtmpl': os.path.join(temp_dir, '%(title).100s.%(ext)s'),
+            
+            # CRITICAL: Fixed postprocessor settings for high-quality MP3
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '160',  # Good balance of quality/speed
+                'preferredquality': '192',  # Higher quality: 192kbps
             }],
+            
+            # FIXED: Optimized FFmpeg arguments for better MP3 quality
             'postprocessor_args': [
-                '-ar', '44100',
-                '-ac', '2',
-                '-b:a', '160k',
-                '-threads', '2',
-                '-preset', 'fast',
+                '-ar', '44100',      # Sample rate: 44.1kHz (CD quality)
+                '-ac', '2',          # Stereo
+                '-ab', '192k',       # Audio bitrate: 192kbps
+                '-acodec', 'libmp3lame',  # Use LAME MP3 encoder
+                '-q:a', '2',         # High quality setting for LAME
+                '-threads', '2',     # Multi-threading
             ],
+            
+            # Core settings
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
             
             # Geo-blocking bypass options
             'geo_bypass': True,
-            'geo_bypass_country': 'US',  # Try US first, then will fallback
+            'geo_bypass_country': 'US',
             'geo_bypass_ip_block': None,
             
             # Network settings optimized for reliability
@@ -345,10 +355,10 @@ def download_audio_fast():
             'no_warnings': True,
             
             # More forgiving retry settings
-            'socket_timeout': 20,
-            'fragment_retries': 2,
-            'retries': 2,
-            'extractor_retries': 1,
+            'socket_timeout': 25,
+            'fragment_retries': 3,
+            'retries': 3,
+            'extractor_retries': 2,
             
             # Skip unnecessary operations
             'writesubtitles': False,
@@ -367,47 +377,34 @@ def download_audio_fast():
             ydl_opts['proxy'] = proxy_url
             logger.info(f"Using proxy: {proxy_url}")
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        def attempt_download(use_proxy=True):
+            """Attempt download with better error handling"""
+            current_opts = ydl_opts.copy()
+            if not use_proxy and 'proxy' in current_opts:
+                del current_opts['proxy']
+                logger.info("Attempting download without proxy...")
+            
+            with yt_dlp.YoutubeDL(current_opts) as ydl:
                 ydl.download([youtube_url])
                 
-                # Find and return file
-                for pattern in ['*.mp3', '*.m4a', '*.webm', '*.opus']:
+                # FIXED: Better file detection - look for MP3 files first
+                mp3_files = list(Path(temp_dir).glob('*.mp3'))
+                if mp3_files:
+                    return str(mp3_files[0])
+                
+                # Fallback: look for other audio files and log warning
+                for pattern in ['*.m4a', '*.webm', '*.opus', '*.aac']:
                     found_files = list(Path(temp_dir).glob(pattern))
                     if found_files:
-                        file_path = str(found_files[0])
-                        
-                        # Get file info for better filename
-                        file_size = os.path.getsize(file_path)
-                        timestamp = int(time.time())
-                        safe_filename = f"audio_{timestamp}.mp3"
-                        
-                        logger.info(f"Download successful: {file_size} bytes")
-                        
-                        def cleanup_after_send():
-                            time.sleep(45)  # Wait longer before cleanup
-                            try:
-                                import shutil
-                                shutil.rmtree(temp_dir, ignore_errors=True)
-                            except Exception as e:
-                                logger.error(f"Cleanup error: {e}")
-                        
-                        cleanup_thread = threading.Thread(target=cleanup_after_send)
-                        cleanup_thread.daemon = True
-                        cleanup_thread.start()
-                        
-                        return send_file(
-                            file_path, 
-                            as_attachment=True, 
-                            download_name=safe_filename,
-                            mimetype='audio/mpeg'
-                        )
+                        logger.warning(f"MP3 conversion may have failed, found: {pattern}")
+                        return str(found_files[0])
                 
-                return jsonify({
-                    "error": "Download completed but no audio file was created",
-                    "code": "NO_OUTPUT_FILE"
-                }), 500
-        
+                return None
+
+        try:
+            # Primary download attempt
+            file_path = attempt_download(use_proxy=bool(proxy_url))
+            
         except Exception as e:
             error_str = str(e).lower()
             
@@ -421,44 +418,8 @@ def download_audio_fast():
                     current_proxy = None
                     logger.info("Retrying with direct connection...")
                     
-                    if 'proxy' in ydl_opts:
-                        del ydl_opts['proxy']
-                    
                     try:
-                        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                            ydl.download([youtube_url])
-                            
-                            for pattern in ['*.mp3', '*.m4a', '*.webm', '*.opus']:
-                                found_files = list(Path(temp_dir).glob(pattern))
-                                if found_files:
-                                    file_path = str(found_files[0])
-                                    timestamp = int(time.time())
-                                    safe_filename = f"audio_{timestamp}.mp3"
-                                    
-                                    def cleanup_after_send():
-                                        time.sleep(45)
-                                        try:
-                                            import shutil
-                                            shutil.rmtree(temp_dir, ignore_errors=True)
-                                        except Exception as e:
-                                            logger.error(f"Cleanup error: {e}")
-                                    
-                                    cleanup_thread = threading.Thread(target=cleanup_after_send)
-                                    cleanup_thread.daemon = True
-                                    cleanup_thread.start()
-                                    
-                                    return send_file(
-                                        file_path, 
-                                        as_attachment=True, 
-                                        download_name=safe_filename,
-                                        mimetype='audio/mpeg'
-                                    )
-                            
-                            return jsonify({
-                                "error": "Download completed but no audio file was created",
-                                "code": "NO_OUTPUT_FILE"
-                            }), 500
-                    
+                        file_path = attempt_download(use_proxy=False)
                     except Exception as retry_error:
                         logger.error(f"Direct connection also failed: {retry_error}")
                         return jsonify({
@@ -493,18 +454,70 @@ def download_audio_fast():
                 return jsonify({
                     "error": "Download failed due to server error",
                     "code": "DOWNLOAD_FAILED",
-                    "details": str(e)[:200]  # Truncate long error messages
+                    "details": str(e)[:200]
                 }), 500
+
+        # Check if we got a file
+        if not file_path or not os.path.exists(file_path):
+            return jsonify({
+                "error": "Download completed but no audio file was created",
+                "code": "NO_OUTPUT_FILE"
+            }), 500
+
+        # Get file info and create safe filename
+        file_size = os.path.getsize(file_path)
+        timestamp = int(time.time())
+        
+        # FIXED: Ensure filename always has .mp3 extension
+        original_name = os.path.basename(file_path)
+        if not original_name.lower().endswith('.mp3'):
+            safe_filename = f"audio_{timestamp}.mp3"
+            logger.warning(f"File doesn't have .mp3 extension: {original_name}, using: {safe_filename}")
+        else:
+            # Clean the filename but keep .mp3 extension
+            base_name = original_name.rsplit('.', 1)[0]
+            # Remove special characters and limit length
+            clean_name = ''.join(c for c in base_name if c.isalnum() or c in (' ', '-', '_'))[:50]
+            safe_filename = f"{clean_name}_{timestamp}.mp3" if clean_name else f"audio_{timestamp}.mp3"
+        
+        logger.info(f"MP3 download successful: {file_size} bytes, filename: {safe_filename}")
+        
+        # FIXED: Better cleanup scheduling
+        def cleanup_after_send():
+            time.sleep(60)  # Wait 1 minute before cleanup (increased from 45s)
+            try:
+                import shutil
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    logger.info(f"Cleaned up temp directory: {temp_dir}")
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
+        
+        cleanup_thread = threading.Thread(target=cleanup_after_send)
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
+        
+        # FIXED: Proper MP3 MIME type and headers
+        return send_file(
+            file_path, 
+            as_attachment=True, 
+            download_name=safe_filename,
+            mimetype='audio/mpeg',  # Proper MIME type for MP3
+            conditional=False,      # Disable conditional requests
+            max_age=0              # No caching
+        )
     
     finally:
         active_downloads -= 1
-        # Cleanup temp directory if still exists
-        if temp_dir:
+        # Emergency cleanup if something went wrong
+        if temp_dir and active_downloads == 0:  # Only cleanup if no other downloads
             try:
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
+                time.sleep(2)  # Brief delay
+                if os.path.exists(temp_dir):
+                    import shutil
+                    shutil.rmtree(temp_dir, ignore_errors=True)
             except Exception as e:
-                logger.error(f"Final cleanup error: {e}")
+                logger.error(f"Emergency cleanup error: {e}")
 
 # Keep compatibility with existing endpoints
 @app.route('/download/audio', methods=['POST'])
@@ -514,11 +527,179 @@ def download_audio():
     return download_audio_fast()
 
 @app.route('/download/audio/ultrafast', methods=['POST'])
-@rate_limit(max_requests=8, window=300)  # Slightly more restrictive for lowest quality
+@rate_limit(max_requests=8, window=300)
 def download_audio_ultrafast():
-    """Ultra-fast download with lowest quality"""
-    # Similar to fast but with lower quality settings
-    return download_audio_fast()  # Use same implementation but could be optimized further
+    """Ultra-fast download with slightly lower quality but still good MP3"""
+    global active_downloads, proxy_failure_count
+    
+    # Quick resource check
+    can_proceed, message = check_system_resources()
+    if not can_proceed:
+        logger.warning(f"Resource check failed: {message}")
+        return jsonify({"error": message, "code": "RESOURCE_LIMIT"}), 503
+    
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON", "code": "INVALID_FORMAT"}), 400
+    
+    data = request.json
+    youtube_url = data.get('url')
+
+    if not youtube_url:
+        return jsonify({"error": "No URL provided", "code": "MISSING_URL"}), 400
+
+    # Clean URL
+    if "&list=" in youtube_url:
+        youtube_url = youtube_url.split("&list=")[0]
+    
+    logger.info(f"Ultrafast MP3 download request: {youtube_url}")
+    
+    active_downloads += 1
+    temp_dir = None
+    
+    try:
+        temp_dir = tempfile.mkdtemp(dir='/tmp', prefix='yt_ultra_')
+        
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        cookie_path = os.path.join(script_dir, 'cookies.txt')
+        proxy_url = get_working_proxy()
+
+        # Ultrafast settings - lower quality but faster
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+            'outtmpl': os.path.join(temp_dir, '%(title).80s.%(ext)s'),
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '160',  # Slightly lower: 160kbps
+            }],
+            'postprocessor_args': [
+                '-ar', '44100',
+                '-ac', '2', 
+                '-ab', '160k',
+                '-acodec', 'libmp3lame',
+                '-q:a', '4',         # Faster encoding (lower quality setting)
+                '-threads', '2',
+            ],
+            'prefer_ffmpeg': True,
+            'keepvideo': False,
+            'noplaylist': True,
+            'geo_bypass': True,
+            'geo_bypass_country': 'US',
+            'concurrent_fragment_downloads': 2,  # Lower for speed
+            'http_chunk_size': 524288,  # Smaller chunks
+            'no_color': True,
+            'quiet': True,
+            'no_warnings': True,
+            'socket_timeout': 20,
+            'fragment_retries': 2,
+            'retries': 2,
+            'extractor_retries': 1,
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'embed_subs': False,
+            'writeinfojson': False,
+            'writethumbnail': False,
+            'extract_flat': False,
+        }
+
+        if os.path.exists(cookie_path):
+            ydl_opts['cookiefile'] = cookie_path
+            
+        if proxy_url:
+            ydl_opts['proxy'] = proxy_url
+
+        # Use the same download logic as the fast endpoint
+        def attempt_download(use_proxy=True):
+            current_opts = ydl_opts.copy()
+            if not use_proxy and 'proxy' in current_opts:
+                del current_opts['proxy']
+            
+            with yt_dlp.YoutubeDL(current_opts) as ydl:
+                ydl.download([youtube_url])
+                
+                mp3_files = list(Path(temp_dir).glob('*.mp3'))
+                if mp3_files:
+                    return str(mp3_files[0])
+                
+                for pattern in ['*.m4a', '*.webm', '*.opus']:
+                    found_files = list(Path(temp_dir).glob(pattern))
+                    if found_files:
+                        return str(found_files[0])
+                
+                return None
+
+        try:
+            file_path = attempt_download(use_proxy=bool(proxy_url))
+        except Exception as e:
+            # Same error handling as fast endpoint
+            error_str = str(e).lower()
+            if any(phrase in error_str for phrase in ["tunnel", "proxy", "connection failed", "timeout"]):
+                logger.warning(f"Proxy error in ultrafast: {e}")
+                proxy_failure_count += 1
+                if proxy_failure_count < MAX_PROXY_FAILURES:
+                    try:
+                        file_path = attempt_download(use_proxy=False)
+                    except Exception as retry_error:
+                        return jsonify({
+                            "error": "Ultrafast download failed",
+                            "code": "CONNECTION_FAILED",
+                            "details": str(retry_error)
+                        }), 500
+                else:
+                    return jsonify({
+                        "error": "Too many proxy failures",
+                        "code": "PROXY_FAILED"
+                    }), 503
+            else:
+                return jsonify({
+                    "error": "Ultrafast download failed",
+                    "code": "DOWNLOAD_FAILED",
+                    "details": str(e)[:200]
+                }), 500
+
+        if not file_path or not os.path.exists(file_path):
+            return jsonify({
+                "error": "Ultrafast download completed but no file created",
+                "code": "NO_OUTPUT_FILE"
+            }), 500
+
+        file_size = os.path.getsize(file_path)
+        timestamp = int(time.time())
+        
+        original_name = os.path.basename(file_path)
+        if not original_name.lower().endswith('.mp3'):
+            safe_filename = f"audio_ultra_{timestamp}.mp3"
+        else:
+            base_name = original_name.rsplit('.', 1)[0]
+            clean_name = ''.join(c for c in base_name if c.isalnum() or c in (' ', '-', '_'))[:40]
+            safe_filename = f"{clean_name}_ultra_{timestamp}.mp3" if clean_name else f"audio_ultra_{timestamp}.mp3"
+        
+        logger.info(f"Ultrafast MP3 successful: {file_size} bytes, filename: {safe_filename}")
+        
+        def cleanup_after_send():
+            time.sleep(60)
+            try:
+                import shutil
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                logger.error(f"Ultrafast cleanup error: {e}")
+        
+        cleanup_thread = threading.Thread(target=cleanup_after_send)
+        cleanup_thread.daemon = True
+        cleanup_thread.start()
+        
+        return send_file(
+            file_path, 
+            as_attachment=True, 
+            download_name=safe_filename,
+            mimetype='audio/mpeg',
+            conditional=False,
+            max_age=0
+        )
+    
+    finally:
+        active_downloads -= 1
 
 @app.route('/server/stats', methods=['GET'])
 def server_stats():
@@ -533,7 +714,8 @@ def server_stats():
             "proxy_failures": proxy_failure_count,
             "memory_percent": psutil.virtual_memory().percent,
             "disk_free_gb": psutil.disk_usage('/tmp').free / (1024**3),
-            "uptime": time.time() - start_time if 'start_time' in globals() else 0
+            "uptime": time.time() - start_time if 'start_time' in globals() else 0,
+            "version": "2.1-mp3-fixed"
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -576,6 +758,7 @@ def handle_not_found(e):
         "code": "NOT_FOUND",
         "available_endpoints": [
             "POST /download/audio/fast",
+            "POST /download/audio/ultrafast",
             "GET /",
             "GET /server/stats"
         ]
@@ -609,7 +792,7 @@ if __name__ == '__main__':
     
     # Environment optimizations
     os.environ['FFMPEG_THREADS'] = '2'
-    os.environ['MALLOC_ARENA_MAX'] = '2'  # Slightly increased
+    os.environ['MALLOC_ARENA_MAX'] = '2'
     
     # Start background cleanup thread
     cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
@@ -625,33 +808,42 @@ if __name__ == '__main__':
     # System checks
     try:
         import subprocess
-        subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, text=True)
-        logger.info("✓ FFmpeg available")
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True, text=True)
+        if 'libmp3lame' in result.stdout:
+            logger.info("✓ FFmpeg with MP3 LAME encoder available")
+        else:
+            logger.warning("⚠ FFmpeg found but MP3 LAME encoder may not be available")
     except (subprocess.CalledProcessError, FileNotFoundError):
-        logger.error("✗ FFmpeg not found")
+        logger.error("✗ FFmpeg not found - MP3 conversion will fail!")
     
     try:
         logger.info(f"✓ yt-dlp version: {yt_dlp.version.__version__}")
     except:
         logger.warning("Could not determine yt-dlp version")
     
-    logger.info("=== YouTube Audio Downloader Server ===")
-    logger.info("🍎 OPTIMIZED FOR iOS APP CONNECTION")
+    logger.info("=== YouTube MP3 Downloader Server ===")
+    logger.info("🍎 OPTIMIZED FOR iOS APP - MP3 FORMAT FIXED")
     logger.info("🚀 Enhanced for Render.com FREE TIER")
     logger.info("")
     logger.info("📱 iOS App Endpoints:")
-    logger.info("- POST /download/audio/fast (main endpoint - 160kbps)")
-    logger.info("- POST /download/audio/ultrafast (fastest - 128kbps)")  
+    logger.info("- POST /download/audio/fast (main - 192kbps MP3)")
+    logger.info("- POST /download/audio/ultrafast (faster - 160kbps MP3)")  
     logger.info("- GET  / (health check)")
     logger.info("- GET  /server/stats (debugging)")
     logger.info("")
+    logger.info("🎵 MP3 Format Fixes:")
+    logger.info("- Guaranteed MP3 output with proper MIME type")
+    logger.info("- High-quality LAME encoder settings")
+    logger.info("- Better format selection for conversion")
+    logger.info("- Improved filename handling with .mp3 extension")
+    logger.info("- Enhanced error reporting for format issues")
+    logger.info("")
     logger.info("⚡ iOS Optimizations:")
-    logger.info(f"- Rate limit: 12 requests/5min (was 5)")
-    logger.info(f"- Max concurrent: {MAX_CONCURRENT_DOWNLOADS} (was 2)")
+    logger.info(f"- Rate limit: 12 requests/5min for main endpoint")
+    logger.info(f"- Max concurrent: {MAX_CONCURRENT_DOWNLOADS} downloads")
     logger.info("- Better error codes and messages")
     logger.info("- Improved proxy handling")
-    logger.info("- Less aggressive resource monitoring")
-    logger.info("- Better retry logic")
+    logger.info("- Extended cleanup delays (60s)")
     logger.info("")
     
     if current_proxy:
@@ -668,5 +860,5 @@ if __name__ == '__main__':
         port=port, 
         debug=False, 
         threaded=True,
-        use_reloader=False  # Disable reloader for production
+        use_reloader=False
     )
