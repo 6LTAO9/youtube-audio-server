@@ -652,6 +652,7 @@ if __name__ == '__main__':
     logger.info("- Improved proxy handling")
     logger.info("- Less aggressive resource monitoring")
     logger.info("- Better retry logic")
+    logger.info("- Keep-alive ping every hour (prevents sleep)")
     logger.info("")
     
     # Proxy status logging
