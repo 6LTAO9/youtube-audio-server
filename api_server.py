@@ -656,17 +656,8 @@ if __name__ == '__main__':
     logger.info("")
     
     # Proxy status logging
-    if DISABLE_PROXY:
-        logger.info("🌐 Proxy: DISABLED (direct connection only)")
-        logger.info("   Set DISABLE_PROXY=false to enable proxy support")
-    elif current_proxy:
-        logger.info(f"🌐 Proxy: {current_proxy} (active)")
-    else:
-        if proxy_failure_count >= MAX_PROXY_FAILURES:
-            logger.info("🌐 Proxy: DISABLED due to failures (direct connection)")
-        else:
-            logger.info("🌐 Proxy: None found (using direct connection)")
-            logger.info("   This is normal - proxy helps with geo-blocking but isn't required")
+    logger.info("🌐 Proxy: DISABLED (direct connection only)")
+    logger.info("   Proxy system disabled to prevent startup errors")
     
     if os.environ.get('RENDER'):
         logger.info("🔥 Running on Render.com")
