@@ -617,11 +617,9 @@ def download_audio_ultrafast():
             with yt_dlp.YoutubeDL(current_opts) as ydl:
                 ydl.download([youtube_url])
                 
-                mp3_files = list(Path(temp_dir).glob('*.mp3'))
-                if mp3_files:
-                    return str(mp3_files[0])
-                
-                for pattern in ['*.m4a', '*.webm', '*.opus']:
+                # Look for any downloaded file
+                audio_extensions = ['*.mp3', '*.m4a', '*.webm', '*.opus', '*.aac', '*.mp4']
+                for pattern in audio_extensions:
                     found_files = list(Path(temp_dir).glob(pattern))
                     if found_files:
                         return str(found_files[0])
