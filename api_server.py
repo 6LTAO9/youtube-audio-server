@@ -311,7 +311,7 @@ def download_audio_fast():
         # Get proxy with better error handling
         proxy_url = get_working_proxy()
 
-        # Optimized settings for iOS app
+        # Optimized settings for iOS app with geo-blocking bypass
         ydl_opts = {
             'format': 'bestaudio[abr<=160]/bestaudio[ext=m4a]/bestaudio',
             'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
@@ -330,6 +330,11 @@ def download_audio_fast():
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
+            
+            # Geo-blocking bypass options
+            'geo_bypass': True,
+            'geo_bypass_country': 'US',  # Try US first, then will fallback
+            'geo_bypass_ip_block': None,
             
             # Network settings optimized for reliability
             'concurrent_fragment_downloads': 3,
