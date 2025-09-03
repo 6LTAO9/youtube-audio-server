@@ -652,28 +652,15 @@ if __name__ == '__main__':
     logger.info("- Improved proxy handling")
     logger.info("- Less aggressive resource monitoring")
     logger.info("- Better retry logic")
-    logger.info("- Keep-alive ping every hour (prevents sleep)")
     logger.info("")
     
-    # Proxy status logging
-    if DISABLE_PROXY:
-        logger.info("🌐 Proxy: DISABLED (direct connection only)")
-        logger.info("   Set DISABLE_PROXY=false to enable proxy support")
-    elif current_proxy:
-        logger.info(f"🌐 Proxy: {current_proxy} (active)")
+    if current_proxy:
+        logger.info(f"🌐 Proxy: {current_proxy}")
     else:
-        if proxy_failure_count >= MAX_PROXY_FAILURES:
-            logger.info("🌐 Proxy: DISABLED due to failures (direct connection)")
-        else:
-            logger.info("🌐 Proxy: None found (using direct connection)")
-            logger.info("   This is normal - proxy helps with geo-blocking but isn't required")
+        logger.info("🌐 Direct connection (no proxy)")
     
     if os.environ.get('RENDER'):
         logger.info("🔥 Running on Render.com")
-        
-    logger.info("")
-    logger.info("💡 To disable proxy warnings, set environment variable:")
-    logger.info("   DISABLE_PROXY=true")
     
     # Run with improved settings
     app.run(
