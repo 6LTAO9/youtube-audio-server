@@ -1,8 +1,4 @@
+python3 -m pip install --upgrade pip
 Flask==2.3.3
 yt-dlp>=2023.9.24
 psutil==5.9.5
-requests==2.31.0
-pathlib
-gunicorn==21.2.0
-Flask-CORS==4.0.0
-yt-dlp==2023.7.6
