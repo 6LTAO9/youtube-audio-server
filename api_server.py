@@ -1,4 +1,64 @@
-import os
+if "requested format is not available" in error_str:
+                logger.warning("Format not available for ultrafast, trying basic fallback...")
+                
+                # Most basic fallback with enhanced stealth
+                fallback_opts = {
+                    'format': 'worst',  # Most basic fallback
+                    'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': '64',  # Very low quality
+                    }],
+                    'prefer_ffmpeg': True,
+                    'keepvideo': False,
+                    'noplaylist': True,
+                    'geo_bypass': True,
+                    'color': 'never',  # Fix compatibility issue
+                    'quiet': True,
+                    'no_warnings': True,
+                    'socket_timeout': 30,
+                    'retries': 1,
+                    'fragment_retries': 1,
+                    'extractor_retries': 1,
+                    'sleep_interval': 3,
+                    'max_sleep_interval': 6,
+                    'user_agent': 'Mozilla/5.0 (Android 10; Mobile; rv:91.0) Gecko/91.0 Firefox/91.0',
+                    'http_headers': {
+                        'User-Agent': 'Mozilla/5.0 (Android 10; Mobile; rv:91.0) Gecko/91.0 Firefox/91.0',
+                        'Accept': '*/*',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                    },
+                    'youtube_include_dash_manifest': False,
+                    'youtube_include_hls_manifest': False,
+                }
+                
+                if proxy_url:
+                    fallback_opts['proxy'] = proxy_url
+                    
+                try:
+                    # Longer delay for fallback
+                    time.sleep(random.uniform(3, 6))
+                    
+                    with yt_dlp.YoutubeDL(fallback_opts) as ydl_fallback:
+                        ydl_fallback.download([youtube_url])
+                        
+                        for pattern in audio_extensions:
+                            found_files = list(Path(temp_dir).glob(pattern))
+                            if found_files:
+                                found_file = str(found_files[0])
+                                timestamp = int(time.time())
+                                safe_filename = f"audio_fast_{timestamp}.mp3"
+                                
+                                def cleanup_after_send():
+                                    time.sleep(45)
+                                    try:
+                                        import shutil
+                                        shutil.rmtree(temp_dir, ignore_errors=True)
+                                    except Exception as e:
+                                        logger.error(f"Cleanup error: {e}")
+                                
+                                cleanup_threaimport os
 import tempfile
 import time
 import threading
@@ -949,7 +1009,8 @@ if __name__ == '__main__':
     logger.info("=== YouTube Audio Downloader Server ===")
     logger.info("🍎 OPTIMIZED FOR iOS APP CONNECTION")
     logger.info("🚀 Enhanced for Render.com FREE TIER")
-    logger.info("🔧 FIXED: Format selection issues")
+    logger.info("🔧 FIXED: Format selection + YouTube anti-bot issues")
+    logger.info("🛡️  ANTI-DETECTION: Enhanced stealth measures")
     logger.info("")
     logger.info("📱 iOS App Endpoints:")
     logger.info("- POST /download/audio/fast (main endpoint - 160kbps)")
@@ -957,20 +1018,27 @@ if __name__ == '__main__':
     logger.info("- GET  / (health check)")
     logger.info("- GET  /server/stats (debugging)")
     logger.info("")
-    logger.info("🔧 Format Fixes Applied:")
-    logger.info("- More flexible format selection with multiple fallbacks")
-    logger.info("- Better error handling for unavailable formats") 
-    logger.info("- Automatic fallback to worst quality if needed")
-    logger.info("- Support for more audio formats (m4a, webm, opus, etc.)")
-    logger.info("- Better debugging output for format issues")
+    logger.info("🔧 Major Fixes Applied:")
+    logger.info("- Fixed yt-dlp compatibility issues (_allow_colors error)")
+    logger.info("- Enhanced anti-detection with random delays") 
+    logger.info("- Better rate limit and anti-bot error handling")
+    logger.info("- Multiple fallback strategies for blocked requests")
+    logger.info("- Mobile user agents and headers for stealth")
+    logger.info("- Conservative retry settings to avoid detection")
     logger.info("")
-    logger.info("⚡ iOS Optimizations:")
+    logger.info("⚡ Enhanced Features:")
     logger.info(f"- Rate limit: 12 requests/5min for fast, 8 for ultrafast")
     logger.info(f"- Max concurrent: {MAX_CONCURRENT_DOWNLOADS}")
-    logger.info("- Better error codes and messages")
-    logger.info("- Improved proxy handling")
-    logger.info("- Less aggressive resource monitoring")
-    logger.info("- Better retry logic with fallbacks")
+    logger.info("- Smart error codes with retry suggestions")
+    logger.info("- Geo-bypass with multiple countries")
+    logger.info("- Random delays to avoid pattern detection")
+    logger.info("- Enhanced proxy handling with failure recovery")
+    logger.info("")
+    logger.info("🚨 Rate Limiting Info:")
+    logger.info("- YouTube may block server IPs temporarily")
+    logger.info("- Longer waits required when rate limited")
+    logger.info("- Server uses delays and stealth measures")
+    logger.info("- Some videos may be geo-blocked or restricted")
     logger.info("")
     
     if current_proxy:
