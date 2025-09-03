@@ -1,4 +1,3 @@
-pip install --upgrade pip
 Flask==2.3.3
 yt-dlp>=2023.9.24
 psutil==5.9.5
