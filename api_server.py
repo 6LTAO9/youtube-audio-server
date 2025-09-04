@@ -475,17 +475,29 @@ def download_audio_ultrafast():
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Extract video info first to get the title
+                info = ydl.extract_info(youtube_url, download=False)
+                video_title = info.get('title', 'Unknown Video')
+                
+                # Clean the title for filename use
+                safe_title = "".join(c for c in video_title if c.isalnum() or c in (' ', '-', '_')).strip()
+                safe_title = safe_title[:50]  # Limit to 50 characters
+                if not safe_title:
+                    safe_title = "Downloaded Audio"
+                
+                # Download the video
                 ydl.download([youtube_url])
                 
                 for pattern in ['*.mp3', '*.m4a', '*.webm', '*.opus']:
                     found_files = list(Path(temp_dir).glob(pattern))
                     if found_files:
                         file_path = str(found_files[0])
-                        timestamp = int(time.time())
-                        safe_filename = f"audio_ultra_{timestamp}.mp3"
+                        
+                        # Use actual video title for filename
+                        safe_filename = f"{safe_title}.mp3"
                         
                         file_size = os.path.getsize(file_path)
-                        logger.info(f"Ultra-fast download successful: {file_size} bytes")
+                        logger.info(f"Ultra-fast download successful: {file_size} bytes - '{video_title}'")
                         
                         def cleanup_after_send():
                             time.sleep(30)
