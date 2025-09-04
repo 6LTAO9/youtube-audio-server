@@ -1,5 +1,4 @@
 Flask==2.3.3
-yt-dlp>=2023.9.24
 psutil==5.9.5
 requests==2.31.0
 pathlib
