@@ -515,6 +515,7 @@ if __name__ == '__main__':
     logger.info("- Better error codes and messages")
     logger.info("- Direct connection (no proxy complications)")
     logger.info("- Less aggressive resource monitoring")
+    logger.info("- Keep-alive ping every hour (prevents sleep)")
     logger.info("")
     
     logger.info("🌐 Proxy: DISABLED (direct connection only)")
