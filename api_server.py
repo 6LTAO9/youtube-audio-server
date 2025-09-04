@@ -416,52 +416,60 @@ def download_audio_ultrafast():
     try:
         temp_dir = tempfile.mkdtemp(dir='/tmp', prefix='yt_ultra_')
         
-        # Speed-optimized but quality-preserved settings
+        # Premium speed-optimized settings
         ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio[abr<=160]/bestaudio',  # Prefer m4a (often faster to extract)
+            'format': 'bestaudio[ext=m4a][abr<=320]/bestaudio[abr<=320]/bestaudio',  # Premium quality
             'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '160',  # Good quality
+                'preferredquality': '320',  # Maximum MP3 quality
             }],
             'postprocessor_args': [
-                '-ar', '44100',              # Standard quality
+                '-ar', '48000',              # High sample rate
                 '-ac', '2',                  # Stereo
-                '-b:a', '160k',
+                '-b:a', '320k',              # Maximum bitrate
                 '-threads', '0',             # Use all CPU threads
-                '-preset', 'faster',         # Fast but not lowest quality
-                '-movflags', '+faststart',   # Optimize for streaming
+                '-preset', 'faster',         # Speed-optimized but high quality
+                '-movflags', '+faststart',
+                '-map_metadata', '-1',       # Strip metadata for speed
+                '-fflags', '+bitexact+fastseek',
             ],
             'prefer_ffmpeg': True,
             'keepvideo': False,
             'noplaylist': True,
             
-            # Maximum network performance
-            'concurrent_fragment_downloads': 12,  # Very aggressive downloading
-            'http_chunk_size': 8388608,           # 8MB chunks - maximum throughput
-            'buffer_size': 262144,                # Large buffer
+            # Extreme network performance
+            'concurrent_fragment_downloads': 20,  # Maximum concurrent downloads
+            'http_chunk_size': 16777216,          # 16MB chunks - absolute maximum
+            'buffer_size': 1048576,               # 1MB buffer
             'no_color': True,
             'quiet': True,
             'no_warnings': True,
             
-            # Minimal retry for maximum speed
-            'socket_timeout': 20,
-            'fragment_retries': 0,               # No retries for maximum speed
+            # Zero tolerance for delays
+            'socket_timeout': 25,
+            'fragment_retries': 0,
             'retries': 0,
-            'extractor_retries': 1,              # Allow one extractor retry
+            'extractor_retries': 1,
             
-            # Speed optimizations
+            # All speed optimizations
             'writesubtitles': False,
             'writeautomaticsub': False,
             'embed_subs': False,
             'writeinfojson': False,
             'writethumbnail': False,
-            'no_check_certificate': True,        # Skip SSL verification
-            'http_headers': {                    # Optimize HTTP headers
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-                'Accept-Encoding': 'gzip, deflate',
+            'no_check_certificate': True,
+            'prefer_insecure': True,             # Skip HTTPS when possible
+            
+            # Advanced network optimization
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive',
+                'Accept': '*/*',
+                'Cache-Control': 'no-cache',
+                'Pragma': 'no-cache',
             }
         }
 
