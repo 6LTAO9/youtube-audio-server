@@ -389,8 +389,148 @@ def download_audio():
 @app.route('/download/audio/ultrafast', methods=['POST'])
 @rate_limit(max_requests=8, window=300)
 def download_audio_ultrafast():
-    """Ultra-fast download with lowest quality"""
-    return download_audio_fast()
+    """Ultra-fast download optimized for speed while maintaining good quality"""
+    global active_downloads
+    
+    can_proceed, message = check_system_resources()
+    if not can_proceed:
+        return jsonify({"error": message, "code": "RESOURCE_LIMIT"}), 503
+    
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON", "code": "INVALID_FORMAT"}), 400
+    
+    data = request.json
+    youtube_url = data.get('url')
+
+    if not youtube_url:
+        return jsonify({"error": "No URL provided", "code": "MISSING_URL"}), 400
+
+    if "&list=" in youtube_url:
+        youtube_url = youtube_url.split("&list=")[0]
+    
+    logger.info(f"Ultra-fast download request: {youtube_url}")
+    
+    active_downloads += 1
+    temp_dir = None
+    
+    try:
+        temp_dir = tempfile.mkdtemp(dir='/tmp', prefix='yt_ultra_')
+        
+        # Speed-optimized but quality-preserved settings
+        ydl_opts = {
+            'format': 'bestaudio[ext=m4a]/bestaudio[abr<=160]/bestaudio',  # Prefer m4a (often faster to extract)
+            'outtmpl': os.path.join(temp_dir, 'audio.%(ext)s'),
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '160',  # Good quality
+            }],
+            'postprocessor_args': [
+                '-ar', '44100',              # Standard quality
+                '-ac', '2',                  # Stereo
+                '-b:a', '160k',
+                '-threads', '0',             # Use all CPU threads
+                '-preset', 'faster',         # Fast but not lowest quality
+                '-movflags', '+faststart',   # Optimize for streaming
+            ],
+            'prefer_ffmpeg': True,
+            'keepvideo': False,
+            'noplaylist': True,
+            
+            # Maximum network performance
+            'concurrent_fragment_downloads': 12,  # Very aggressive downloading
+            'http_chunk_size': 8388608,           # 8MB chunks - maximum throughput
+            'buffer_size': 262144,                # Large buffer
+            'no_color': True,
+            'quiet': True,
+            'no_warnings': True,
+            
+            # Minimal retry for maximum speed
+            'socket_timeout': 20,
+            'fragment_retries': 0,               # No retries for maximum speed
+            'retries': 0,
+            'extractor_retries': 1,              # Allow one extractor retry
+            
+            # Speed optimizations
+            'writesubtitles': False,
+            'writeautomaticsub': False,
+            'embed_subs': False,
+            'writeinfojson': False,
+            'writethumbnail': False,
+            'no_check_certificate': True,        # Skip SSL verification
+            'http_headers': {                    # Optimize HTTP headers
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Accept-Encoding': 'gzip, deflate',
+                'Connection': 'keep-alive',
+            }
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([youtube_url])
+                
+                for pattern in ['*.mp3', '*.m4a', '*.webm', '*.opus']:
+                    found_files = list(Path(temp_dir).glob(pattern))
+                    if found_files:
+                        file_path = str(found_files[0])
+                        timestamp = int(time.time())
+                        safe_filename = f"audio_ultra_{timestamp}.mp3"
+                        
+                        file_size = os.path.getsize(file_path)
+                        logger.info(f"Ultra-fast download successful: {file_size} bytes")
+                        
+                        def cleanup_after_send():
+                            time.sleep(30)
+                            try:
+                                import shutil
+                                shutil.rmtree(temp_dir, ignore_errors=True)
+                            except Exception as e:
+                                logger.error(f"Cleanup error: {e}")
+                        
+                        cleanup_thread = threading.Thread(target=cleanup_after_send)
+                        cleanup_thread.daemon = True
+                        cleanup_thread.start()
+                        
+                        return send_file(
+                            file_path, 
+                            as_attachment=True, 
+                            download_name=safe_filename,
+                            mimetype='audio/mpeg'
+                        )
+                
+                return jsonify({
+                    "error": "Download completed but no audio file was created",
+                    "code": "NO_OUTPUT_FILE"
+                }), 500
+        
+        except Exception as e:
+            error_str = str(e).lower()
+            
+            if "429" in error_str or "too many requests" in error_str:
+                return jsonify({
+                    "error": "YouTube rate limit exceeded. Please wait a few minutes.",
+                    "code": "YOUTUBE_RATE_LIMIT"
+                }), 429
+            elif any(phrase in error_str for phrase in ["unavailable", "private", "deleted", "removed"]):
+                return jsonify({
+                    "error": "Video is unavailable, private, or has been removed",
+                    "code": "VIDEO_UNAVAILABLE"
+                }), 400
+            else:
+                logger.error(f"Ultra-fast download failed: {e}")
+                return jsonify({
+                    "error": "Download failed",
+                    "code": "DOWNLOAD_FAILED"
+                }), 500
+    
+    finally:
+        active_downloads -= 1
+        if temp_dir:
+            try:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception as e:
+                logger.error(f"Final cleanup error: {e}")
 
 @app.route('/server/stats', methods=['GET'])
 def server_stats():
