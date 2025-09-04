@@ -298,6 +298,17 @@ def download_audio_fast():
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                # Extract video info first to get the title
+                info = ydl.extract_info(youtube_url, download=False)
+                video_title = info.get('title', 'Unknown Video')
+                
+                # Clean the title for filename use
+                safe_title = "".join(c for c in video_title if c.isalnum() or c in (' ', '-', '_')).strip()
+                safe_title = safe_title[:50]  # Limit to 50 characters
+                if not safe_title:
+                    safe_title = "Downloaded Audio"
+                
+                # Download the video
                 ydl.download([youtube_url])
                 
                 # Find and return file
@@ -306,12 +317,11 @@ def download_audio_fast():
                     if found_files:
                         file_path = str(found_files[0])
                         
-                        # Get file info for better filename
-                        file_size = os.path.getsize(file_path)
-                        timestamp = int(time.time())
-                        safe_filename = f"audio_{timestamp}.mp3"
+                        # Use actual video title for filename
+                        safe_filename = f"{safe_title}.mp3"
                         
-                        logger.info(f"Download successful: {file_size} bytes")
+                        file_size = os.path.getsize(file_path)
+                        logger.info(f"Download successful: {file_size} bytes - '{video_title}'")
                         
                         def cleanup_after_send():
                             time.sleep(45)  # Wait longer before cleanup
@@ -665,7 +675,7 @@ if __name__ == '__main__':
     logger.info("")
     logger.info("📱 iOS App Endpoints:")
     logger.info("- POST /download/audio/fast (main endpoint - 160kbps)")
-    logger.info("- POST /download/audio/ultrafast (fastest - 128kbps)")  
+    logger.info("- POST /download/audio/ultrafast (fastest - 320kbps)")  
     logger.info("- GET  / (health check)")
     logger.info("- GET  /server/stats (debugging)")
     logger.info("")
